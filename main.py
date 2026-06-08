@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-Pure-Python + numpy Neural Language Model
-==========================================
+Pure-Python + numpy Neural Language Model  (GPU-capable via CuPy)
+==================================================================
 Architecture
   - Embedding matrix  E : [vocab_size × embed_dim]
   - Context window      : last ctx_len tokens → concat embeddings → flat vec
   - Hidden layer        : Linear → LayerNorm → tanh
   - Output layer        : Linear → softmax over vocab
   - Loss                : cross-entropy
-  - Optimiser           : Adam (pure numpy)
+  - Optimiser           : Adam (numpy / CuPy)
 
-Everything else kept from the n-gram version:
+GPU support
+  - Requires CuPy (pip install cupy-cuda11x / cupy-cuda12x).
+  - Set  use_gpu=True  and  gpu_device=<id>  in settings.
+  - At startup the code queries available CUDA devices and lists them.
+  - All tensor operations are transparently dispatched to the selected
+    GPU via CuPy; the rest of the code is unchanged.
+  - If CuPy is unavailable the setting is silently ignored.
+
+Everything else kept from the original:
   - Project Gutenberg Auto-Data Downloader (dynamic ID discovery)
   - Threaded / single-thread file loading with progress bar
   - Interactive settings menu
@@ -41,6 +49,64 @@ import numpy as np
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GPU / Array-backend  (xp = numpy or cupy)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_cupy_available = False
+_cupy_devices: List[Tuple[int, str]] = []   # [(device_id, name), …]
+
+try:
+    import cupy as cp          # type: ignore
+    _cupy_available = True
+    # Enumerate CUDA devices
+    n_dev = cp.cuda.runtime.getDeviceCount()
+    for _di in range(n_dev):
+        cp.cuda.Device(_di).use()
+        _props = cp.cuda.runtime.getDeviceProperties(_di)
+        _name  = _props["name"].decode() if isinstance(_props["name"], bytes) else str(_props["name"])
+        _cupy_devices.append((_di, _name))
+except Exception:
+    _cupy_available = False
+
+# Active backend — replaced by _set_backend() at runtime
+_xp = np           # the array module in use
+_device_id: int = 0
+
+def _set_backend(use_gpu: bool, gpu_device: int = 0) -> None:
+    """Switch the global array backend to CuPy (GPU) or NumPy (CPU)."""
+    global _xp, _device_id
+    if use_gpu and _cupy_available:
+        _device_id = gpu_device
+        cp.cuda.Device(gpu_device).use()
+        _xp = cp
+    else:
+        _xp = np
+        _device_id = -1
+
+def _to_numpy(arr) -> np.ndarray:
+    """Move an array to CPU numpy (no-op if already numpy)."""
+    if _xp is np:
+        return arr
+    return cp.asnumpy(arr)
+
+def _to_xp(arr: np.ndarray):
+    """Move a numpy array to the active backend device."""
+    if _xp is np:
+        return arr
+    return cp.asarray(arr)
+
+def gpu_info_string() -> str:
+    if not _cupy_available:
+        return "CuPy not installed — GPU unavailable."
+    if not _cupy_devices:
+        return "CuPy installed but no CUDA devices found."
+    lines = ["Available CUDA devices:"]
+    for did, name in _cupy_devices:
+        lines.append(f"  [{did}] {name}")
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -67,12 +133,12 @@ DEFAULT_SETTINGS = {
     "model_file":          "model.npz",
     "settings_file":       "settings.json",
     # ── Vocabulary ───────────────────────────────────────────────────────
-    "vocab_size":          20000,   # most-frequent tokens kept
+    "vocab_size":          20000,
     "lowercase":           True,
     # ── Architecture ─────────────────────────────────────────────────────
-    "ctx_len":             6,       # context window (tokens fed in)
-    "embed_dim":           64,      # embedding dimensionality
-    "hidden_dim":          256,     # hidden layer width
+    "ctx_len":             6,
+    "embed_dim":           64,
+    "hidden_dim":          256,
     # ── Training ─────────────────────────────────────────────────────────
     "epochs":              3,
     "batch_size":          256,
@@ -84,6 +150,9 @@ DEFAULT_SETTINGS = {
     "max_generate_tokens": 80,
     "temperature":         0.8,
     "top_k":               20,
+    # ── GPU ──────────────────────────────────────────────────────────────
+    "use_gpu":             False,   # enable GPU via CuPy
+    "gpu_device":          0,       # CUDA device index
     # ── Auto-Data Downloader ─────────────────────────────────────────────
     "auto_download":       False,
     "ad_max_books":        10,
@@ -186,7 +255,7 @@ class Vocabulary:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Adam optimiser state
+# Adam optimiser state  (backend-agnostic — uses _xp)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AdamState:
@@ -198,41 +267,41 @@ class AdamState:
         self.beta2 = beta2
         self.eps   = eps
         self.t     = 0
-        self.m: Dict[str, np.ndarray] = {}
-        self.v: Dict[str, np.ndarray] = {}
+        self.m: Dict[str, object] = {}
+        self.v: Dict[str, object] = {}
 
-    def step(self, params: Dict[str, np.ndarray],
-             grads:  Dict[str, np.ndarray]) -> None:
+    def step(self, params: Dict[str, object],
+             grads:  Dict[str, object]) -> None:
         self.t += 1
+        xp = _xp
         for name, g in grads.items():
             if name not in self.m:
-                self.m[name] = np.zeros_like(params[name])
-                self.v[name] = np.zeros_like(params[name])
+                self.m[name] = xp.zeros_like(params[name])
+                self.v[name] = xp.zeros_like(params[name])
             self.m[name] = self.beta1 * self.m[name] + (1 - self.beta1) * g
             self.v[name] = self.beta2 * self.v[name] + (1 - self.beta2) * g * g
             m_hat = self.m[name] / (1 - self.beta1 ** self.t)
             v_hat = self.v[name] / (1 - self.beta2 ** self.t)
-            params[name] -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+            params[name] -= self.lr * m_hat / (xp.sqrt(v_hat) + self.eps)
 
     def state_dict(self) -> dict:
         return {
             "lr": self.lr, "beta1": self.beta1, "beta2": self.beta2,
             "eps": self.eps, "t": self.t,
-            "m_keys":   list(self.m.keys()),
-            "v_keys":   list(self.v.keys()),
         }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Neural Language Model
+# Neural Language Model  (backend-agnostic — all ops via _xp)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NeuralLM:
     """
     Embedding lookup → concat → hidden (LayerNorm + tanh) → output (softmax).
 
-    Forward pass returns logits (pre-softmax); loss computed externally so
-    the backward pass can be written cleanly.
+    All array operations use the global _xp module (numpy CPU or cupy GPU).
+    Parameters are stored on the active device; call .to_device() after
+    switching backends.
     """
 
     def __init__(self, vocab_size: int, embed_dim: int,
@@ -247,49 +316,50 @@ class NeuralLM:
         scale_h = np.sqrt(2.0 / self.input_dim)
         scale_o = np.sqrt(2.0 / hidden_dim)
 
+        # Always initialise on CPU; move to device in to_device()
         self.params: Dict[str, np.ndarray] = {
-            # Embedding
-            "E":       np.random.randn(vocab_size, embed_dim).astype(np.float32) * scale_e,
-            # Hidden
-            "W1":      np.random.randn(self.input_dim, hidden_dim).astype(np.float32) * scale_h,
-            "b1":      np.zeros(hidden_dim, dtype=np.float32),
-            # LayerNorm (hidden)
-            "ln_g":    np.ones(hidden_dim,  dtype=np.float32),
-            "ln_b":    np.zeros(hidden_dim, dtype=np.float32),
-            # Output
-            "W2":      np.random.randn(hidden_dim, vocab_size).astype(np.float32) * scale_o,
-            "b2":      np.zeros(vocab_size, dtype=np.float32),
+            "E":    np.random.randn(vocab_size, embed_dim).astype(np.float32) * scale_e,
+            "W1":   np.random.randn(self.input_dim, hidden_dim).astype(np.float32) * scale_h,
+            "b1":   np.zeros(hidden_dim, dtype=np.float32),
+            "ln_g": np.ones(hidden_dim,  dtype=np.float32),
+            "ln_b": np.zeros(hidden_dim, dtype=np.float32),
+            "W2":   np.random.randn(hidden_dim, vocab_size).astype(np.float32) * scale_o,
+            "b2":   np.zeros(vocab_size, dtype=np.float32),
         }
+
+    # ── device management ────────────────────────────────────────────────
+
+    def to_device(self) -> None:
+        """Upload all parameters to the active backend (_xp)."""
+        self.params = {k: _to_xp(v) for k, v in self.params.items()}
+
+    def to_cpu(self) -> None:
+        """Pull all parameters back to CPU numpy (needed for save)."""
+        self.params = {k: _to_numpy(v) for k, v in self.params.items()}
 
     # ── forward ──────────────────────────────────────────────────────────
 
-    def forward(self, ctx_ids: np.ndarray
-                ) -> Tuple[np.ndarray, dict]:
+    def forward(self, ctx_ids) -> Tuple[object, dict]:
         """
-        ctx_ids : [B, ctx_len]  int32
+        ctx_ids : [B, ctx_len]  int32 (on active device)
         returns : logits [B, vocab_size], cache for backward
         """
-        B = ctx_ids.shape[0]
-        p = self.params
+        xp = _xp
+        B  = ctx_ids.shape[0]
+        p  = self.params
 
-        # Embedding lookup + flatten
-        emb  = p["E"][ctx_ids]                          # [B, ctx_len, embed_dim]
-        x    = emb.reshape(B, self.input_dim)            # [B, input_dim]
+        emb  = p["E"][ctx_ids]
+        x    = emb.reshape(B, self.input_dim)
 
-        # Hidden linear
-        pre  = x @ p["W1"] + p["b1"]                    # [B, hidden_dim]
+        pre  = x @ p["W1"] + p["b1"]
 
-        # LayerNorm
         mu   = pre.mean(axis=1, keepdims=True)
         var  = pre.var( axis=1, keepdims=True) + 1e-5
-        xhat = (pre - mu) / np.sqrt(var)
-        ln   = p["ln_g"] * xhat + p["ln_b"]             # [B, hidden_dim]
+        xhat = (pre - mu) / xp.sqrt(var)
+        ln   = p["ln_g"] * xhat + p["ln_b"]
 
-        # tanh
-        h    = np.tanh(ln)                               # [B, hidden_dim]
-
-        # Output
-        logits = h @ p["W2"] + p["b2"]                  # [B, vocab_size]
+        h      = xp.tanh(ln)
+        logits = h @ p["W2"] + p["b2"]
 
         cache = dict(ctx_ids=ctx_ids, emb=emb, x=x,
                      pre=pre, mu=mu, var=var, xhat=xhat,
@@ -298,77 +368,74 @@ class NeuralLM:
 
     # ── backward ─────────────────────────────────────────────────────────
 
-    def backward(self, logits: np.ndarray,
-                 targets: np.ndarray,
-                 cache: dict) -> Tuple[float, Dict[str, np.ndarray]]:
+    def backward(self, logits, targets, cache) -> Tuple[float, Dict[str, object]]:
         """
-        targets : [B]  int32
+        targets : [B]  int32 (on active device)
         returns : (mean cross-entropy loss, grads dict)
         """
+        xp = _xp
         B  = logits.shape[0]
         p  = self.params
 
-        # Softmax + cross-entropy loss
-        logits_s = logits - logits.max(axis=1, keepdims=True)   # numerical stability
-        exp_l    = np.exp(logits_s)
-        probs    = exp_l / exp_l.sum(axis=1, keepdims=True)     # [B, V]
-        loss     = -np.log(probs[np.arange(B), targets] + 1e-12).mean()
+        logits_s = logits - logits.max(axis=1, keepdims=True)
+        exp_l    = xp.exp(logits_s)
+        probs    = exp_l / exp_l.sum(axis=1, keepdims=True)
+        loss     = -xp.log(probs[xp.arange(B), targets] + 1e-12).mean()
 
-        # dL/d_logits
         dlogits  = probs.copy()
-        dlogits[np.arange(B), targets] -= 1
-        dlogits /= B                                             # [B, V]
+        dlogits[xp.arange(B), targets] -= 1
+        dlogits /= B
 
-        # Output layer
-        dW2 = cache["h"].T @ dlogits                            # [hidden, V]
+        dW2 = cache["h"].T @ dlogits
         db2 = dlogits.sum(axis=0)
-        dh  = dlogits @ p["W2"].T                               # [B, hidden]
+        dh  = dlogits @ p["W2"].T
 
-        # tanh backward
-        dln = dh * (1 - cache["h"] ** 2)                       # [B, hidden]
-
-        # LayerNorm backward
+        dln    = dh * (1 - cache["h"] ** 2)
         dln_g  = (dln * cache["xhat"]).sum(axis=0)
         dln_b  = dln.sum(axis=0)
         dxhat  = dln * p["ln_g"]
-        std    = np.sqrt(cache["var"])
+        std    = xp.sqrt(cache["var"])
         dpre   = (1 / (B * std)) * (
             B * dxhat
             - dxhat.sum(axis=1, keepdims=True)
             - cache["xhat"] * (dxhat * cache["xhat"]).sum(axis=1, keepdims=True)
         )
 
-        # Hidden layer
         dW1 = cache["x"].T @ dpre
         db1 = dpre.sum(axis=0)
-        dx  = dpre @ p["W1"].T                                  # [B, input_dim]
+        dx  = dpre @ p["W1"].T
 
-        # Embedding backward
-        dx_emb = dx.reshape(B, self.ctx_len, self.embed_dim)    # [B, ctx, E]
-        dE     = np.zeros_like(p["E"])
-        np.add.at(dE, cache["ctx_ids"], dx_emb)
+        dx_emb = dx.reshape(B, self.ctx_len, self.embed_dim)
+        dE     = xp.zeros_like(p["E"])
+        # xp.add.at works for both numpy and cupy
+        xp.add.at(dE, cache["ctx_ids"], dx_emb)
 
         grads = {
             "E": dE, "W1": dW1, "b1": db1,
             "ln_g": dln_g, "ln_b": dln_b,
             "W2": dW2, "b2": db2,
         }
-        return float(loss), grads
+        # Return scalar loss on CPU
+        return float(_to_numpy(loss)), grads
 
     # ── predict ──────────────────────────────────────────────────────────
 
     def predict_probs(self, ctx_ids: np.ndarray) -> np.ndarray:
-        """ctx_ids: [ctx_len]  → probs [vocab_size]"""
-        logits, _ = self.forward(ctx_ids[np.newaxis])
-        logits_s  = logits[0] - logits[0].max()
-        exp_l     = np.exp(logits_s)
+        """ctx_ids: [ctx_len] numpy int32 → probs [vocab_size] numpy float32"""
+        ctx_dev = _to_xp(ctx_ids[np.newaxis])
+        logits, _ = self.forward(ctx_dev)
+        logits_cpu = _to_numpy(logits[0])
+        logits_s   = logits_cpu - logits_cpu.max()
+        exp_l      = np.exp(logits_s)
         return exp_l / exp_l.sum()
 
     # ── serialisation ────────────────────────────────────────────────────
 
     def to_npz(self) -> io.BytesIO:
+        """Serialise params (always on CPU)."""
         buf = io.BytesIO()
-        np.savez_compressed(buf, **self.params)
+        cpu_params = {k: _to_numpy(v) for k, v in self.params.items()}
+        np.savez_compressed(buf, **cpu_params)
         buf.seek(0)
         return buf
 
@@ -376,7 +443,7 @@ class NeuralLM:
     def from_npz(cls, buf: io.BytesIO,
                  vocab_size: int, embed_dim: int,
                  ctx_len: int, hidden_dim: int) -> "NeuralLM":
-        m = cls(vocab_size, embed_dim, ctx_len, hidden_dim)
+        m    = cls(vocab_size, embed_dim, ctx_len, hidden_dim)
         data = np.load(buf)
         for k in m.params:
             m.params[k] = data[k]
@@ -389,15 +456,11 @@ class NeuralLM:
 
 def save_model(model: NeuralLM, vocab: Vocabulary,
                hparams: dict, model_file: str) -> None:
-    header = {
-        "vocab":   vocab.to_dict(),
-        "hparams": hparams,
-    }
+    header = {"vocab": vocab.to_dict(), "hparams": hparams}
     header_bytes = json.dumps(header).encode("utf-8")
-    weights_buf  = model.to_npz()
+    weights_buf  = model.to_npz()      # always CPU numpy
 
     with gzip.open(model_file, "wb") as f:
-        # 8-byte little-endian length prefix for header
         f.write(len(header_bytes).to_bytes(8, "little"))
         f.write(header_bytes)
         f.write(weights_buf.read())
@@ -413,9 +476,9 @@ def load_model(model_file: str) -> Optional[Tuple[NeuralLM, Vocabulary, dict]]:
     header      = json.loads(raw[8: 8 + hlen])
     weights_buf = io.BytesIO(raw[8 + hlen:])
 
-    vocab   = Vocabulary.from_dict(header["vocab"])
-    hp      = header["hparams"]
-    model   = NeuralLM.from_npz(
+    vocab  = Vocabulary.from_dict(header["vocab"])
+    hp     = header["hparams"]
+    model  = NeuralLM.from_npz(
         weights_buf,
         vocab_size  = vocab.size,
         embed_dim   = hp["embed_dim"],
@@ -438,17 +501,12 @@ def load_tokens_from_file(path: str, lowercase: bool) -> List[str]:
 def build_dataset(token_lists: List[List[str]],
                   vocab: Vocabulary,
                   ctx_len: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Returns X [N, ctx_len] int32, Y [N] int32.
-    Each sample: context of ctx_len tokens → next token.
-    PAD_ID (0) is used to left-pad the start of each file.
-    """
+    """Returns X [N, ctx_len] int32, Y [N] int32 on CPU numpy."""
     PAD_ID = vocab.tok2id[PAD_TOKEN]
     xs, ys = [], []
 
     for toks in token_lists:
-        ids = [vocab.encode(t) for t in toks]
-        # pad the start so every token gets a training sample
+        ids    = [vocab.encode(t) for t in toks]
         padded = [PAD_ID] * ctx_len + ids
         for i in range(ctx_len, len(padded)):
             xs.append(padded[i - ctx_len: i])
@@ -499,6 +557,22 @@ def train(settings: dict) -> None:
     lr          = float(settings["learning_rate"])
     workers     = max(1, int(settings["workers"]))
 
+    use_gpu    = bool(settings.get("use_gpu", False))
+    gpu_device = int(settings.get("gpu_device", 0))
+
+    # ── Activate GPU backend ──────────────────────────────────────────────
+    _set_backend(use_gpu, gpu_device)
+    if _xp is not np:
+        dev_name = _cupy_devices[gpu_device][1] if gpu_device < len(_cupy_devices) else "?"
+        print(f"[GPU] Using CUDA device {gpu_device}: {dev_name}")
+    else:
+        if use_gpu and not _cupy_available:
+            print("[GPU] CuPy not available — falling back to CPU.")
+        elif use_gpu:
+            print("[GPU] No valid CUDA device found — falling back to CPU.")
+        else:
+            print("[CPU] Running on CPU.")
+
     ensure_folder(folder)
 
     # ── Auto-download ─────────────────────────────────────────────────────
@@ -526,16 +600,18 @@ def train(settings: dict) -> None:
             dl_thread.stop()
         return
 
-    print(f"\n=== Neural LM Training ===")
+    backend_label = (
+        f"GPU:{gpu_device}" if _xp is not np else "CPU"
+    )
+    print(f"\n=== Neural LM Training  [{backend_label}] ===")
     print(f"Files: {len(files)}  |  Vocab: {vocab_size}  |  "
           f"ctx={ctx_len}  embed={embed_dim}  hidden={hidden_dim}")
     print(f"Epochs: {epochs}  |  Batch: {batch_size}  |  LR: {lr}")
     print()
 
-    # ── Tokenise files (threaded or single) ──────────────────────────────
+    # ── Tokenise files ────────────────────────────────────────────────────
     print("Loading and tokenising files…")
     t0 = time.perf_counter()
-
     token_lists: List[List[str]] = [None] * len(files)  # type: ignore
 
     if single_thread:
@@ -572,22 +648,28 @@ def train(settings: dict) -> None:
     vocab.build(token_lists)
     print(f"  Vocab size: {vocab.size}")
 
-    # ── Build dataset ────────────────────────────────────────────────────
+    # ── Build dataset (CPU) ──────────────────────────────────────────────
     print("Building training dataset…")
     X, Y = build_dataset(token_lists, vocab, ctx_len)
-    del token_lists   # free RAM
+    del token_lists
     N = X.shape[0]
     print(f"  Samples: {human_num(N)}")
 
+    # ── Upload dataset to GPU if needed ──────────────────────────────────
+    if _xp is not np:
+        print("  Uploading dataset to GPU…")
+        X = _to_xp(X)
+        Y = _to_xp(Y)
+
     # ── Init model + optimiser ───────────────────────────────────────────
     model = NeuralLM(vocab.size, embed_dim, ctx_len, hidden_dim)
+    model.to_device()    # no-op on CPU; uploads params to GPU
     adam  = AdamState(lr=lr)
 
     param_count = sum(p.size for p in model.params.values())
     print(f"  Parameters: {human_num(param_count)}")
     print()
 
-    # ── Training loop ────────────────────────────────────────────────────
     hparams = {
         "vocab_size": vocab_size, "ctx_len": ctx_len,
         "embed_dim":  embed_dim,  "hidden_dim": hidden_dim,
@@ -596,14 +678,13 @@ def train(settings: dict) -> None:
     global_start = time.perf_counter()
 
     for epoch in range(1, epochs + 1):
-        perm    = np.random.permutation(N)
-        X_shuf  = X[perm]
-        Y_shuf  = Y[perm]
+        perm   = _xp.random.permutation(N)
+        X_shuf = X[perm]
+        Y_shuf = Y[perm]
 
         epoch_loss  = 0.0
         n_batches   = 0
         epoch_start = time.perf_counter()
-
         batches_total = (N + batch_size - 1) // batch_size
 
         for b_start in range(0, N, batch_size):
@@ -639,7 +720,7 @@ def train(settings: dict) -> None:
               f"avg loss={epoch_loss/n_batches:.4f}  "
               f"time={epoch_elapsed:.1f}s")
 
-        # Save checkpoint after each epoch
+        # Save checkpoint (to_npz pulls weights back to CPU automatically)
         save_model(model, vocab, hparams, settings["model_file"])
 
     if dl_thread:
@@ -661,10 +742,8 @@ def generate_text(model: NeuralLM, vocab: Vocabulary,
     ctx_len = model.ctx_len
     PAD_ID  = vocab.tok2id[PAD_TOKEN]
 
-    # Encode prompt
     prompt_toks = tokenize(prompt, lowercase=lowercase)
     ctx = [vocab.encode(t) for t in prompt_toks]
-    # Pad / trim to ctx_len
     if len(ctx) < ctx_len:
         ctx = [PAD_ID] * (ctx_len - len(ctx)) + ctx
     else:
@@ -674,34 +753,30 @@ def generate_text(model: NeuralLM, vocab: Vocabulary,
 
     for _ in range(max_tokens):
         ctx_arr = np.array(ctx, dtype=np.int32)
-        probs   = model.predict_probs(ctx_arr)          # [vocab_size]
+        probs   = model.predict_probs(ctx_arr)   # always returns CPU numpy
 
-        # Temperature scaling
-        temp = max(0.05, float(temperature))
+        temp   = max(0.05, float(temperature))
         logits = np.log(probs + 1e-12) / temp
         logits -= logits.max()
         probs   = np.exp(logits)
         probs  /= probs.sum()
 
-        # Top-k filtering
         if top_k and top_k > 0:
-            k         = min(top_k, len(probs))
-            top_idx   = np.argpartition(probs, -k)[-k:]
-            mask      = np.zeros_like(probs)
+            k       = min(top_k, len(probs))
+            top_idx = np.argpartition(probs, -k)[-k:]
+            mask    = np.zeros_like(probs)
             mask[top_idx] = probs[top_idx]
-            probs     = mask / mask.sum()
+            probs   = mask / mask.sum()
 
-        # Sample
-        next_id = int(np.random.choice(len(probs), p=probs))
+        next_id  = int(np.random.choice(len(probs), p=probs))
         next_tok = vocab.decode(next_id)
 
         if next_tok in (PAD_TOKEN, UNK_TOKEN):
-            # re-sample once ignoring special tokens
             probs[vocab.tok2id[PAD_TOKEN]] = 0
             probs[vocab.tok2id[UNK_TOKEN]] = 0
             s = probs.sum()
             if s > 0:
-                probs /= s
+                probs   /= s
                 next_id  = int(np.random.choice(len(probs), p=probs))
                 next_tok = vocab.decode(next_id)
             else:
@@ -718,13 +793,20 @@ def generate_text(model: NeuralLM, vocab: Vocabulary,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def chat(settings: dict) -> None:
+    use_gpu    = bool(settings.get("use_gpu", False))
+    gpu_device = int(settings.get("gpu_device", 0))
+    _set_backend(use_gpu, gpu_device)
+
     result = load_model(settings["model_file"])
     if result is None:
         print("No model found. Train first.")
         return
 
     model, vocab, hparams = result
-    print(f"Model loaded — vocab={vocab.size}  "
+    model.to_device()   # upload weights to GPU if active
+
+    backend_label = f"GPU:{gpu_device}" if _xp is not np else "CPU"
+    print(f"Model loaded [{backend_label}] — vocab={vocab.size}  "
           f"ctx={model.ctx_len}  embed={model.embed_dim}  "
           f"hidden={model.hidden_dim}")
     print("Type 'exit' to quit.\n")
@@ -746,7 +828,7 @@ def chat(settings: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Auto-Data Downloader  (unchanged from n-gram version)
+# Auto-Data Downloader  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_id_cache(path: str) -> Set[int]:
@@ -914,7 +996,8 @@ def auto_download_blocking(settings: dict, label_prefix: str = "") -> None:
         return
 
     slots = max_books - count
-    print(f"{label_prefix}Auto-download: {count}/{max_books} books — fetching up to {slots} more…")
+    print(f"{label_prefix}Auto-download: {count}/{max_books} books — "
+          f"fetching up to {slots} more…")
 
     ids = _ready_ids(folder, n_needed=slots * 2, verbose=True)
     if not ids:
@@ -967,14 +1050,16 @@ class AutoDownloadThread(threading.Thread):
         refill_below = int(self._s["ad_refill_below"])
 
         ensure_folder(folder)
-        queue: List[int] = _ready_ids(folder, n_needed=max_books * 2, verbose=False)
+        queue: List[int] = _ready_ids(folder, n_needed=max_books * 2,
+                                       verbose=False)
         rejected_local: Set[int] = set()
 
         while not self._stop_evt.is_set():
             count, used = _folder_state(folder)
             if (count < refill_below) or (used < max_bytes and count < max_books):
                 if not queue:
-                    queue = _ready_ids(folder, n_needed=max_books * 2, verbose=False)
+                    queue = _ready_ids(folder, n_needed=max_books * 2,
+                                       verbose=False)
                 while queue and not self._stop_evt.is_set():
                     count, used = _folder_state(folder)
                     if count >= max_books or used >= max_bytes:
@@ -1009,7 +1094,7 @@ def find_text_files(folder: str) -> List[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Settings menu
+# Settings menu  (GPU section added)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def show_settings(s: dict) -> None:
@@ -1018,17 +1103,33 @@ def show_settings(s: dict) -> None:
     rej  = _load_id_cache(REJECTED_FILE)
     print("\nCurrent settings:")
     groups = [
-        ("Files",       ["input_folder", "model_file", "lowercase"]),
-        ("Vocabulary",  ["vocab_size"]),
-        ("Architecture",["ctx_len", "embed_dim", "hidden_dim"]),
-        ("Training",    ["epochs", "batch_size", "learning_rate",
-                         "workers", "single_thread", "show_progress"]),
-        ("Generation",  ["max_generate_tokens", "temperature", "top_k"]),
+        ("Files",        ["input_folder", "model_file", "lowercase"]),
+        ("Vocabulary",   ["vocab_size"]),
+        ("Architecture", ["ctx_len", "embed_dim", "hidden_dim"]),
+        ("Training",     ["epochs", "batch_size", "learning_rate",
+                          "workers", "single_thread", "show_progress"]),
+        ("Generation",   ["max_generate_tokens", "temperature", "top_k"]),
     ]
     for label, keys in groups:
         print(f"  ── {label}")
         for k in keys:
             print(f"    {k}: {s[k]}")
+
+    # GPU section
+    use_gpu    = bool(s.get("use_gpu", False))
+    gpu_device = int(s.get("gpu_device", 0))
+    print(f"  ── GPU")
+    print(f"    use_gpu:    {'ON' if use_gpu else 'OFF'}")
+    if _cupy_available:
+        if _cupy_devices:
+            for did, name in _cupy_devices:
+                marker = " ◀ selected" if (use_gpu and did == gpu_device) else ""
+                print(f"    [{did}] {name}{marker}")
+        else:
+            print("    (CuPy installed but no CUDA devices found)")
+    else:
+        print("    (CuPy not installed — install cupy-cuda11x or cupy-cuda12x)")
+
     ad_on = s.get("auto_download", False)
     print(f"  ── Auto-Data Downloader")
     print(f"    auto_download:   {'ON' if ad_on else 'OFF'}")
@@ -1037,6 +1138,59 @@ def show_settings(s: dict) -> None:
     print(f"    ad_refill_below: {s['ad_refill_below']}")
     print(f"    folder now:      {count} books, {used//1048576} MB")
     print(f"    discovered IDs:  {len(disc)}   rejected: {len(rej)}")
+
+
+def _gpu_submenu(s: dict) -> None:
+    while True:
+        use_gpu    = bool(s.get("use_gpu", False))
+        gpu_device = int(s.get("gpu_device", 0))
+
+        print(f"\n── GPU Settings ───────────────────────────────────────")
+        print(f"  Status: {'ON' if use_gpu else 'OFF'}  |  "
+              f"Selected device: {gpu_device}")
+        print()
+        print(gpu_info_string())
+        print()
+        print("1) Toggle GPU ON/OFF")
+        print("2) Select GPU device")
+        print("0) Back")
+
+        c = input("> ").strip()
+
+        if c == "1":
+            if not _cupy_available:
+                print("CuPy is not installed.  "
+                      "Install with:  pip install cupy-cuda11x  "
+                      "(or cupy-cuda12x for CUDA 12)")
+            elif not _cupy_devices:
+                print("No CUDA devices detected.")
+            else:
+                s["use_gpu"] = not use_gpu
+                print("GPU:", "ON" if s["use_gpu"] else "OFF")
+        elif c == "2":
+            if not _cupy_available or not _cupy_devices:
+                print("No CUDA devices available.")
+            else:
+                print("Device IDs:")
+                for did, name in _cupy_devices:
+                    print(f"  {did}  {name}")
+                v = input("Enter device ID: ").strip()
+                try:
+                    n = int(v)
+                    if any(d == n for d, _ in _cupy_devices):
+                        s["gpu_device"] = n
+                        print(f"GPU device set to {n}.")
+                    else:
+                        print("Invalid device ID.")
+                except ValueError:
+                    print("Invalid input.")
+        elif c == "0":
+            save_settings(s)
+            return
+        else:
+            print("Invalid.")
+
+        save_settings(s)
 
 
 def _auto_dl_submenu(s: dict) -> None:
@@ -1148,6 +1302,7 @@ def settings_menu(s: dict) -> None:
         print("  e) Temperature")
         print("  k) Top-k")
         print(" Other")
+        print("  u) GPU settings")
         print("  a) Auto-Data Downloader")
         print("  0) Back")
 
@@ -1259,6 +1414,8 @@ def settings_menu(s: dict) -> None:
                     s["top_k"] = n
             except ValueError:
                 pass
+        elif c == "u":
+            _gpu_submenu(s)
         elif c == "a":
             _auto_dl_submenu(s)
         elif c == "0":
@@ -1280,7 +1437,9 @@ def main() -> None:
     s = load_settings(DEFAULT_SETTINGS["settings_file"])
     ensure_folder(s["input_folder"])
 
-    parser = argparse.ArgumentParser(description="Pure Python + numpy Neural LM")
+    parser = argparse.ArgumentParser(
+        description="Pure Python + numpy Neural LM (GPU-capable via CuPy)"
+    )
     parser.add_argument(
         "mode", nargs="?",
         choices=["train", "chat", "settings", "download"],
@@ -1288,9 +1447,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.mode == "train":
-        train(s); return
+        train(s);    return
     if args.mode == "chat":
-        chat(s);  return
+        chat(s);     return
     if args.mode == "settings":
         settings_menu(s); return
     if args.mode == "download":
@@ -1300,8 +1459,18 @@ def main() -> None:
         count, used = _folder_state(s["input_folder"])
         ad_ind = (f" [Auto-DL ON | {count} books, {used//1048576}MB]"
                   if s.get("auto_download") else "")
+        use_gpu    = bool(s.get("use_gpu", False))
+        gpu_device = int(s.get("gpu_device", 0))
+        if use_gpu and _cupy_available and _cupy_devices:
+            dev_name = _cupy_devices[gpu_device][1] if gpu_device < len(_cupy_devices) else "?"
+            gpu_ind  = f" [GPU:{gpu_device} {dev_name}]"
+        elif use_gpu:
+            gpu_ind = " [GPU: unavailable — will use CPU]"
+        else:
+            gpu_ind = " [CPU]"
+
         model_exists = os.path.exists(s["model_file"])
-        print(f"\n=== Neural LM ==={ad_ind}")
+        print(f"\n=== Neural LM ==={ad_ind}{gpu_ind}")
         print(f"  model: {s['model_file']}"
               + (" ✓" if model_exists else " (not trained yet)"))
         print("1) Train")
