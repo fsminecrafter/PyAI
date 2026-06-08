@@ -64,30 +64,48 @@ _cupy_devices: List[Tuple[int, str]] = []   # [(device_id, name), …]
 try:
     import cupy as cp          # type: ignore
 
-    # Verify basic cupy tensor ops work (no curand needed)
+    # Verify basic cupy tensor ops work (no curand needed).
+    # This is the only thing that determines _cupy_available.
     _test_arr = cp.array([1.0, 2.0], dtype=cp.float32)
     _ = _test_arr + 1
     del _test_arr
     _cupy_available = True
 
-    # Probe curand separately — permutation needs it
+except Exception:
+    _cupy_available   = False
+    _curand_available = False
+
+if _cupy_available:
+    # Probe curand separately — permutation needs it, but its absence is
+    # non-fatal (we fall back to numpy shuffling).
     try:
         _ = cp.random.permutation(4)
         _curand_available = True
     except Exception:
         _curand_available = False
 
-    # Enumerate CUDA devices
-    n_dev = cp.cuda.runtime.getDeviceCount()
-    for _di in range(n_dev):
-        cp.cuda.Device(_di).use()
-        _props = cp.cuda.runtime.getDeviceProperties(_di)
-        _name  = _props["name"].decode() if isinstance(_props["name"], bytes) else str(_props["name"])
-        _cupy_devices.append((_di, _name))
-
-except Exception:
-    _cupy_available   = False
-    _curand_available = False
+    # Enumerate CUDA devices.  Wrapped independently so a driver/runtime
+    # quirk during enumeration can't retroactively mark CuPy unavailable.
+    try:
+        n_dev = cp.cuda.runtime.getDeviceCount()
+        for _di in range(n_dev):
+            try:
+                cp.cuda.Device(_di).use()
+                _props = cp.cuda.runtime.getDeviceProperties(_di)
+                _name  = (_props["name"].decode()
+                          if isinstance(_props["name"], bytes)
+                          else str(_props["name"]))
+                _cupy_devices.append((_di, _name))
+            except Exception:
+                # Device listed but properties unreadable — add a placeholder.
+                _cupy_devices.append((_di, f"CUDA device {_di}"))
+    except Exception:
+        # getDeviceCount failed entirely; try probing device 0 directly.
+        try:
+            cp.cuda.Device(0).use()
+            _cupy_devices.append((0, "CUDA device 0"))
+        except Exception:
+            pass  # Truly no devices accessible.
 
 # Active backend — replaced by _set_backend() at runtime
 _xp        = np
