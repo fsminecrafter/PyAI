@@ -61,31 +61,32 @@ _cupy_available  = False
 _curand_available = False
 _cupy_devices: List[Tuple[int, str]] = []   # [(device_id, name), …]
 
+_cupy_import_error: str = ""   # human-readable reason if CuPy is unusable
+
 try:
     import cupy as cp          # type: ignore
-
-    # Verify basic cupy tensor ops work (no curand needed).
-    # This is the only thing that determines _cupy_available.
-    _test_arr = cp.array([1.0, 2.0], dtype=cp.float32)
-    _ = _test_arr + 1
-    del _test_arr
+    # Just importing is enough to declare CuPy available.
+    # We intentionally do NOT run a tensor op here — creating a CuPy array
+    # forces CUDA context init, which can raise non-Exception BaseException
+    # subclasses (or .so load errors) that would be silently swallowed and
+    # falsely mark CuPy as unavailable.
     _cupy_available = True
-
-except Exception:
-    _cupy_available   = False
-    _curand_available = False
+except BaseException as _e:
+    _cupy_available    = False
+    _curand_available  = False
+    _cupy_import_error = str(_e)
 
 if _cupy_available:
-    # Probe curand separately — permutation needs it, but its absence is
-    # non-fatal (we fall back to numpy shuffling).
+    # Probe curand — permutation needs it, but its absence is non-fatal
+    # (we fall back to numpy shuffling).
     try:
         _ = cp.random.permutation(4)
         _curand_available = True
-    except Exception:
+    except BaseException:
         _curand_available = False
 
-    # Enumerate CUDA devices.  Wrapped independently so a driver/runtime
-    # quirk during enumeration can't retroactively mark CuPy unavailable.
+    # Enumerate CUDA devices.  Each step wrapped independently so a
+    # driver/runtime quirk can't retroactively mark CuPy unavailable.
     try:
         n_dev = cp.cuda.runtime.getDeviceCount()
         for _di in range(n_dev):
@@ -96,15 +97,14 @@ if _cupy_available:
                           if isinstance(_props["name"], bytes)
                           else str(_props["name"]))
                 _cupy_devices.append((_di, _name))
-            except Exception:
-                # Device listed but properties unreadable — add a placeholder.
+            except BaseException:
                 _cupy_devices.append((_di, f"CUDA device {_di}"))
-    except Exception:
-        # getDeviceCount failed entirely; try probing device 0 directly.
+    except BaseException:
+        # getDeviceCount failed; probe device 0 directly as fallback.
         try:
             cp.cuda.Device(0).use()
             _cupy_devices.append((0, "CUDA device 0"))
-        except Exception:
+        except BaseException:
             pass  # Truly no devices accessible.
 
 # Active backend — replaced by _set_backend() at runtime
@@ -140,15 +140,18 @@ def _to_xp(arr: np.ndarray):
 
 def gpu_info_string() -> str:
     if not _cupy_available:
+        if _cupy_import_error:
+            return (f"CuPy failed to import — GPU unavailable.\n"
+                    f"  Reason: {_cupy_import_error}")
         return "CuPy not installed — GPU unavailable."
     lines = []
     if not _curand_available:
         lines.append(
-            "  WARNING: libcurand.so not found — random shuffling will use numpy "
-            "(all other GPU ops are fine)."
+            "  WARNING: libcurand.so not found — random shuffling will use "
+            "numpy (all other GPU ops are fine)."
         )
     if not _cupy_devices:
-        lines.append("CuPy installed but no CUDA devices found.")
+        lines.append("CuPy imported OK but no CUDA devices found/accessible.")
         return "\n".join(lines)
     lines.insert(0, "Available CUDA devices:")
     for did, name in _cupy_devices:
@@ -1520,7 +1523,10 @@ def show_settings(s: dict) -> None:
         else:
             print("    (CuPy installed but no CUDA devices found)")
     else:
-        print("    (CuPy not installed — install cupy-cuda11x or cupy-cuda12x)")
+        if _cupy_import_error:
+            print(f"    (CuPy import failed: {_cupy_import_error[:80]})")
+        else:
+            print("    (CuPy not installed — install cupy-cuda11x or cupy-cuda12x)")
 
     ad_on = s.get("auto_download", False)
     mt    = not bool(s.get("single_thread", False))
@@ -1547,15 +1553,21 @@ def _gpu_submenu(s: dict) -> None:
         print()
         print("1) Toggle GPU ON/OFF")
         print("2) Select GPU device")
+        print("3) Run GPU diagnostics")
         print("0) Back")
 
         c = input("> ").strip()
 
-        if c == "1":
+        if c == "3":
+            _gpu_diagnostics()
+        elif c == "1":
             if not _cupy_available:
-                print("CuPy is not installed.  "
-                      "Install with:  pip install cupy-cuda11x  "
-                      "(or cupy-cuda12x for CUDA 12)")
+                if _cupy_import_error:
+                    print(f"CuPy failed to import: {_cupy_import_error[:120]}")
+                else:
+                    print("CuPy is not installed.  "
+                          "Install with:  pip install cupy-cuda11x  "
+                          "(or cupy-cuda12x for CUDA 12)")
             elif not _cupy_devices:
                 print("No CUDA devices detected.")
             else:
@@ -1868,7 +1880,13 @@ def main() -> None:
             if not _curand_available:
                 gpu_ind += " (curand missing—shuffle via numpy)"
         elif use_gpu:
-            gpu_ind = " [GPU: unavailable — will use CPU]"
+            if not _cupy_available:
+                reason = f": {_cupy_import_error[:60]}" if _cupy_import_error else " (not installed)"
+                gpu_ind = f" [GPU: import failed{reason} — using CPU]"
+            elif not _cupy_devices:
+                gpu_ind = " [GPU: no devices found — using CPU]"
+            else:
+                gpu_ind = " [GPU: unavailable — using CPU]"
         else:
             gpu_ind = " [CPU]"
 
