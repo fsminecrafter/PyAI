@@ -14,16 +14,15 @@ GPU support
   - Requires CuPy (pip install cupy-cuda11x / cupy-cuda12x).
   - Set  use_gpu=True  and  gpu_device=<id>  in settings.
   - At startup the code queries available CUDA devices and lists them.
-  - All tensor operations are transparently dispatched to the selected
-    GPU via CuPy; the rest of the code is unchanged.
+  - Random shuffling always uses numpy (avoids curand dependency).
   - If CuPy is unavailable the setting is silently ignored.
 
-Everything else kept from the original:
-  - Project Gutenberg Auto-Data Downloader (dynamic ID discovery)
-  - Threaded / single-thread file loading with progress bar
-  - Interactive settings menu
-  - Save / load (npz weights + json vocab, gzip'd)
-  - Chat / generate mode with temperature + top-k sampling
+Memory-safe training
+  - Files are processed in chunks; only one chunk lives in RAM at a time.
+  - Chunk size is auto-tuned to stay within available system RAM.
+
+Book downloader
+  - Multi-threaded concurrent downloads with per-book progress bars and ETA.
 """
 
 from __future__ import annotations
@@ -43,34 +42,75 @@ import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
+
+try:
+    import psutil as _psutil
+    _PSUTIL = True
+except ImportError:
+    _PSUTIL = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GPU / Array-backend  (xp = numpy or cupy)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_cupy_available = False
+_cupy_available  = False
+_curand_available = False
 _cupy_devices: List[Tuple[int, str]] = []   # [(device_id, name), …]
+
+_cupy_import_error: str = ""   # human-readable reason if CuPy is unusable
 
 try:
     import cupy as cp          # type: ignore
+    # Just importing is enough to declare CuPy available.
+    # We intentionally do NOT run a tensor op here — creating a CuPy array
+    # forces CUDA context init, which can raise non-Exception BaseException
+    # subclasses (or .so load errors) that would be silently swallowed and
+    # falsely mark CuPy as unavailable.
     _cupy_available = True
-    # Enumerate CUDA devices
-    n_dev = cp.cuda.runtime.getDeviceCount()
-    for _di in range(n_dev):
-        cp.cuda.Device(_di).use()
-        _props = cp.cuda.runtime.getDeviceProperties(_di)
-        _name  = _props["name"].decode() if isinstance(_props["name"], bytes) else str(_props["name"])
-        _cupy_devices.append((_di, _name))
-except Exception:
-    _cupy_available = False
+except BaseException as _e:
+    _cupy_available    = False
+    _curand_available  = False
+    _cupy_import_error = str(_e)
+
+if _cupy_available:
+    # Probe curand — permutation needs it, but its absence is non-fatal
+    # (we fall back to numpy shuffling).
+    try:
+        _ = cp.random.permutation(4)
+        _curand_available = True
+    except BaseException:
+        _curand_available = False
+
+    # Enumerate CUDA devices.  Each step wrapped independently so a
+    # driver/runtime quirk can't retroactively mark CuPy unavailable.
+    try:
+        n_dev = cp.cuda.runtime.getDeviceCount()
+        for _di in range(n_dev):
+            try:
+                cp.cuda.Device(_di).use()
+                _props = cp.cuda.runtime.getDeviceProperties(_di)
+                _name  = (_props["name"].decode()
+                          if isinstance(_props["name"], bytes)
+                          else str(_props["name"]))
+                _cupy_devices.append((_di, _name))
+            except BaseException:
+                _cupy_devices.append((_di, f"CUDA device {_di}"))
+    except BaseException:
+        # getDeviceCount failed; probe device 0 directly as fallback.
+        try:
+            cp.cuda.Device(0).use()
+            _cupy_devices.append((0, "CUDA device 0"))
+        except BaseException:
+            pass  # Truly no devices accessible.
 
 # Active backend — replaced by _set_backend() at runtime
-_xp = np           # the array module in use
-_device_id: int = 0
+_xp        = np
+_device_id: int = -1
+
 
 def _set_backend(use_gpu: bool, gpu_device: int = 0) -> None:
     """Switch the global array backend to CuPy (GPU) or NumPy (CPU)."""
@@ -83,11 +123,13 @@ def _set_backend(use_gpu: bool, gpu_device: int = 0) -> None:
         _xp = np
         _device_id = -1
 
+
 def _to_numpy(arr) -> np.ndarray:
     """Move an array to CPU numpy (no-op if already numpy)."""
     if _xp is np:
         return arr
     return cp.asnumpy(arr)
+
 
 def _to_xp(arr: np.ndarray):
     """Move a numpy array to the active backend device."""
@@ -95,12 +137,23 @@ def _to_xp(arr: np.ndarray):
         return arr
     return cp.asarray(arr)
 
+
 def gpu_info_string() -> str:
     if not _cupy_available:
+        if _cupy_import_error:
+            return (f"CuPy failed to import — GPU unavailable.\n"
+                    f"  Reason: {_cupy_import_error}")
         return "CuPy not installed — GPU unavailable."
+    lines = []
+    if not _curand_available:
+        lines.append(
+            "  WARNING: libcurand.so not found — random shuffling will use "
+            "numpy (all other GPU ops are fine)."
+        )
     if not _cupy_devices:
-        return "CuPy installed but no CUDA devices found."
-    lines = ["Available CUDA devices:"]
+        lines.append("CuPy imported OK but no CUDA devices found/accessible.")
+        return "\n".join(lines)
+    lines.insert(0, "Available CUDA devices:")
     for did, name in _cupy_devices:
         lines.append(f"  [{did}] {name}")
     return "\n".join(lines)
@@ -128,6 +181,9 @@ NO_SPACE_AFTER  = {"(", "[", "{", "«", "\u201c", "'", "$", "£", "€"}
 PAD_TOKEN = "<PAD>"
 UNK_TOKEN = "<UNK>"
 
+# Fraction of available RAM to use for dataset chunk
+CHUNK_RAM_FRACTION = 0.40
+
 DEFAULT_SETTINGS = {
     "input_folder":        "input_files",
     "model_file":          "model.npz",
@@ -151,8 +207,8 @@ DEFAULT_SETTINGS = {
     "temperature":         0.8,
     "top_k":               20,
     # ── GPU ──────────────────────────────────────────────────────────────
-    "use_gpu":             False,   # enable GPU via CuPy
-    "gpu_device":          0,       # CUDA device index
+    "use_gpu":             False,
+    "gpu_device":          0,
     # ── Auto-Data Downloader ─────────────────────────────────────────────
     "auto_download":       False,
     "ad_max_books":        10,
@@ -225,8 +281,7 @@ class Vocabulary:
         counts: Counter = Counter()
         for toks in token_lists:
             counts.update(toks)
-
-        special = [PAD_TOKEN, UNK_TOKEN]
+        special     = [PAD_TOKEN, UNK_TOKEN]
         most_common = [t for t, _ in counts.most_common(self.max_size - len(special))]
         self.id2tok = special + most_common
         self.tok2id = {t: i for i, t in enumerate(self.id2tok)}
@@ -298,10 +353,8 @@ class AdamState:
 class NeuralLM:
     """
     Embedding lookup → concat → hidden (LayerNorm + tanh) → output (softmax).
-
     All array operations use the global _xp module (numpy CPU or cupy GPU).
-    Parameters are stored on the active device; call .to_device() after
-    switching backends.
+    Random shuffling always uses numpy to avoid curand dependency.
     """
 
     def __init__(self, vocab_size: int, embed_dim: int,
@@ -316,7 +369,6 @@ class NeuralLM:
         scale_h = np.sqrt(2.0 / self.input_dim)
         scale_o = np.sqrt(2.0 / hidden_dim)
 
-        # Always initialise on CPU; move to device in to_device()
         self.params: Dict[str, np.ndarray] = {
             "E":    np.random.randn(vocab_size, embed_dim).astype(np.float32) * scale_e,
             "W1":   np.random.randn(self.input_dim, hidden_dim).astype(np.float32) * scale_h,
@@ -330,27 +382,20 @@ class NeuralLM:
     # ── device management ────────────────────────────────────────────────
 
     def to_device(self) -> None:
-        """Upload all parameters to the active backend (_xp)."""
         self.params = {k: _to_xp(v) for k, v in self.params.items()}
 
     def to_cpu(self) -> None:
-        """Pull all parameters back to CPU numpy (needed for save)."""
         self.params = {k: _to_numpy(v) for k, v in self.params.items()}
 
     # ── forward ──────────────────────────────────────────────────────────
 
     def forward(self, ctx_ids) -> Tuple[object, dict]:
-        """
-        ctx_ids : [B, ctx_len]  int32 (on active device)
-        returns : logits [B, vocab_size], cache for backward
-        """
         xp = _xp
         B  = ctx_ids.shape[0]
         p  = self.params
 
         emb  = p["E"][ctx_ids]
         x    = emb.reshape(B, self.input_dim)
-
         pre  = x @ p["W1"] + p["b1"]
 
         mu   = pre.mean(axis=1, keepdims=True)
@@ -369,10 +414,6 @@ class NeuralLM:
     # ── backward ─────────────────────────────────────────────────────────
 
     def backward(self, logits, targets, cache) -> Tuple[float, Dict[str, object]]:
-        """
-        targets : [B]  int32 (on active device)
-        returns : (mean cross-entropy loss, grads dict)
-        """
         xp = _xp
         B  = logits.shape[0]
         p  = self.params
@@ -407,7 +448,6 @@ class NeuralLM:
 
         dx_emb = dx.reshape(B, self.ctx_len, self.embed_dim)
         dE     = xp.zeros_like(p["E"])
-        # xp.add.at works for both numpy and cupy
         xp.add.at(dE, cache["ctx_ids"], dx_emb)
 
         grads = {
@@ -415,13 +455,11 @@ class NeuralLM:
             "ln_g": dln_g, "ln_b": dln_b,
             "W2": dW2, "b2": db2,
         }
-        # Return scalar loss on CPU
         return float(_to_numpy(loss)), grads
 
     # ── predict ──────────────────────────────────────────────────────────
 
     def predict_probs(self, ctx_ids: np.ndarray) -> np.ndarray:
-        """ctx_ids: [ctx_len] numpy int32 → probs [vocab_size] numpy float32"""
         ctx_dev = _to_xp(ctx_ids[np.newaxis])
         logits, _ = self.forward(ctx_dev)
         logits_cpu = _to_numpy(logits[0])
@@ -432,7 +470,6 @@ class NeuralLM:
     # ── serialisation ────────────────────────────────────────────────────
 
     def to_npz(self) -> io.BytesIO:
-        """Serialise params (always on CPU)."""
         buf = io.BytesIO()
         cpu_params = {k: _to_numpy(v) for k, v in self.params.items()}
         np.savez_compressed(buf, **cpu_params)
@@ -451,14 +488,14 @@ class NeuralLM:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Model save / load  (gzip'd archive: JSON header + npz weights)
+# Model save / load
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_model(model: NeuralLM, vocab: Vocabulary,
                hparams: dict, model_file: str) -> None:
-    header = {"vocab": vocab.to_dict(), "hparams": hparams}
+    header       = {"vocab": vocab.to_dict(), "hparams": hparams}
     header_bytes = json.dumps(header).encode("utf-8")
-    weights_buf  = model.to_npz()      # always CPU numpy
+    weights_buf  = model.to_npz()
 
     with gzip.open(model_file, "wb") as f:
         f.write(len(header_bytes).to_bytes(8, "little"))
@@ -489,7 +526,7 @@ def load_model(model_file: str) -> Optional[Tuple[NeuralLM, Vocabulary, dict]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Training data builder
+# Training data builder  (streaming / chunked)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_tokens_from_file(path: str, lowercase: bool) -> List[str]:
@@ -498,28 +535,67 @@ def load_tokens_from_file(path: str, lowercase: bool) -> List[str]:
     return tokenize(text, lowercase=lowercase)
 
 
-def build_dataset(token_lists: List[List[str]],
-                  vocab: Vocabulary,
-                  ctx_len: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Returns X [N, ctx_len] int32, Y [N] int32 on CPU numpy."""
+def _estimate_chunk_size(ctx_len: int, sample_tokens: int = 500_000) -> int:
+    """
+    Estimate how many tokens can fit in one chunk while staying within
+    CHUNK_RAM_FRACTION of available RAM.  Each (X,Y) sample = ctx_len+1
+    int32 values = (ctx_len+1)*4 bytes.
+    """
+    if _PSUTIL:
+        avail = _psutil.virtual_memory().available
+    else:
+        avail = 2 * 1024 ** 3   # fallback: assume 2 GB
+
+    bytes_per_sample = (ctx_len + 1) * 4
+    budget_bytes     = int(avail * CHUNK_RAM_FRACTION)
+    max_samples      = budget_bytes // bytes_per_sample
+    # tokens ≈ samples (one sample per token after ctx padding)
+    return max(50_000, min(max_samples, 10_000_000))
+
+
+def build_dataset_from_tokens(tokens: List[str],
+                               vocab: Vocabulary,
+                               ctx_len: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Build X [N, ctx_len] and Y [N] from a flat token list (CPU numpy)."""
     PAD_ID = vocab.tok2id[PAD_TOKEN]
-    xs, ys = [], []
-
-    for toks in token_lists:
-        ids    = [vocab.encode(t) for t in toks]
-        padded = [PAD_ID] * ctx_len + ids
-        for i in range(ctx_len, len(padded)):
-            xs.append(padded[i - ctx_len: i])
-            ys.append(padded[i])
-
-    X = np.array(xs, dtype=np.int32)
-    Y = np.array(ys, dtype=np.int32)
+    ids    = [vocab.encode(t) for t in tokens]
+    padded = [PAD_ID] * ctx_len + ids
+    n      = len(ids)
+    X      = np.empty((n, ctx_len), dtype=np.int32)
+    Y      = np.empty(n,            dtype=np.int32)
+    for i in range(n):
+        X[i] = padded[i: i + ctx_len]
+        Y[i] = padded[i + ctx_len]
     return X, Y
 
 
+def _iter_file_chunks(files: List[str], lowercase: bool,
+                      chunk_tokens: int) -> Iterator[List[str]]:
+    """
+    Yield flat token lists of ≤ chunk_tokens tokens, reading files one by
+    one.  Never holds more than ~2 files' worth of tokens in memory.
+    """
+    buf: List[str] = []
+    for path in files:
+        toks = load_tokens_from_file(path, lowercase)
+        buf.extend(toks)
+        while len(buf) >= chunk_tokens:
+            yield buf[:chunk_tokens]
+            buf = buf[chunk_tokens:]
+    if buf:
+        yield buf
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers: progress, formatting
+# Progress / display helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _term_width() -> int:
+    try:
+        return os.get_terminal_size().columns
+    except Exception:
+        return 80
+
 
 def format_bar(done: int, total: int, width: int = 30) -> str:
     if total <= 0:
@@ -535,6 +611,101 @@ def human_num(n: float) -> str:
             return f"{n:.1f}{unit}" if unit else f"{int(n)}"
         n /= 1000
     return f"{n:.1f}T"
+
+
+def human_bytes(n: int) -> str:
+    for unit in ["B", "KB", "MB", "GB"]:
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _sys_usage_str() -> str:
+    """One-line CPU / RAM usage string."""
+    if not _PSUTIL:
+        return ""
+    cpu  = _psutil.cpu_percent(interval=None)
+    mem  = _psutil.virtual_memory()
+    used = mem.used  // (1024 ** 2)
+    tot  = mem.total // (1024 ** 2)
+    s    = f"CPU {cpu:4.1f}%  RAM {used}/{tot} MB"
+
+    # GPU via CuPy mempool (if active)
+    if _xp is not np:
+        try:
+            pool  = cp.get_default_memory_pool()
+            g_used = pool.used_bytes()  // (1024 ** 2)
+            g_tot  = pool.total_bytes() // (1024 ** 2)
+            s     += f"  GPU-mem {g_used}/{g_tot} MB"
+        except Exception:
+            pass
+    return s
+
+
+def _print_file_loading_progress(done: int, total: int,
+                                  token_count: int) -> None:
+    bar = format_bar(done, total, width=28)
+    sys.stdout.write(
+        f"\r  Loading {bar} {done}/{total} files  "
+        f"({human_num(token_count)} tokens)"
+        + " " * 4
+    )
+    sys.stdout.flush()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Two-pass vocab builder (streaming, low memory)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_vocab_streaming(files: List[str], lowercase: bool,
+                           vocab_size: int,
+                           workers: int, single_thread: bool,
+                           show_prog: bool) -> Tuple[Vocabulary, int]:
+    """
+    Stream through every file once, count tokens, build vocab.
+    Returns (vocab, total_token_count).
+    """
+    counts: Counter = Counter()
+    total_tokens = 0
+    n_files = len(files)
+
+    print("  Pass 1/2 — counting tokens for vocabulary…")
+
+    if single_thread:
+        for i, path in enumerate(files):
+            toks = load_tokens_from_file(path, lowercase)
+            counts.update(toks)
+            total_tokens += len(toks)
+            if show_prog:
+                _print_file_loading_progress(i + 1, n_files, total_tokens)
+    else:
+        token_lists: List[Optional[List[str]]] = [None] * n_files
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            future_map = {
+                ex.submit(load_tokens_from_file, p, lowercase): idx
+                for idx, p in enumerate(files)
+            }
+            done = 0
+            for fut in as_completed(future_map):
+                idx = future_map[fut]
+                toks = fut.result()
+                token_lists[idx] = toks
+                counts.update(toks)
+                total_tokens += len(toks)
+                done += 1
+                if show_prog:
+                    _print_file_loading_progress(done, n_files, total_tokens)
+
+    if show_prog:
+        sys.stdout.write("\n")
+
+    special     = [PAD_TOKEN, UNK_TOKEN]
+    most_common = [t for t, _ in counts.most_common(vocab_size - len(special))]
+    vocab       = Vocabulary(max_size=vocab_size)
+    vocab.id2tok = special + most_common
+    vocab.tok2id = {t: i for i, t in enumerate(vocab.id2tok)}
+    return vocab, total_tokens
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -565,6 +736,8 @@ def train(settings: dict) -> None:
     if _xp is not np:
         dev_name = _cupy_devices[gpu_device][1] if gpu_device < len(_cupy_devices) else "?"
         print(f"[GPU] Using CUDA device {gpu_device}: {dev_name}")
+        if not _curand_available:
+            print("[GPU] Note: libcurand not found — shuffling via numpy (no impact on training).")
     else:
         if use_gpu and not _cupy_available:
             print("[GPU] CuPy not available — falling back to CPU.")
@@ -584,7 +757,7 @@ def train(settings: dict) -> None:
             dl_thread = AutoDownloadThread(settings)
             dl_thread.start()
 
-    # ── Load files ────────────────────────────────────────────────────────
+    # ── Find files ────────────────────────────────────────────────────────
     files = find_text_files(folder)
     if not files:
         if dl_thread:
@@ -600,75 +773,39 @@ def train(settings: dict) -> None:
             dl_thread.stop()
         return
 
-    backend_label = (
-        f"GPU:{gpu_device}" if _xp is not np else "CPU"
-    )
+    backend_label = f"GPU:{gpu_device}" if _xp is not np else "CPU"
     print(f"\n=== Neural LM Training  [{backend_label}] ===")
     print(f"Files: {len(files)}  |  Vocab: {vocab_size}  |  "
           f"ctx={ctx_len}  embed={embed_dim}  hidden={hidden_dim}")
     print(f"Epochs: {epochs}  |  Batch: {batch_size}  |  LR: {lr}")
+    if _PSUTIL:
+        mem = _psutil.virtual_memory()
+        print(f"System RAM: {mem.available // (1024**2)} MB available of "
+              f"{mem.total // (1024**2)} MB total")
     print()
 
-    # ── Tokenise files ────────────────────────────────────────────────────
-    print("Loading and tokenising files…")
-    t0 = time.perf_counter()
-    token_lists: List[List[str]] = [None] * len(files)  # type: ignore
+    # ── Pass 1: Build vocabulary (streaming) ─────────────────────────────
+    vocab, total_tokens = build_vocab_streaming(
+        files, lowercase, vocab_size, workers, single_thread, show_prog
+    )
+    print(f"  Vocab size: {vocab.size}  |  Total tokens: {human_num(total_tokens)}")
 
-    if single_thread:
-        for i, path in enumerate(files):
-            token_lists[i] = load_tokens_from_file(path, lowercase)
-            if show_prog:
-                sys.stdout.write(f"\r  {i+1}/{len(files)} files tokenised")
-                sys.stdout.flush()
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            future_map = {
-                ex.submit(load_tokens_from_file, p, lowercase): idx
-                for idx, p in enumerate(files)
-            }
-            done = 0
-            for fut in as_completed(future_map):
-                idx = future_map[fut]
-                token_lists[idx] = fut.result()
-                done += 1
-                if show_prog:
-                    sys.stdout.write(f"\r  {done}/{len(files)} files tokenised")
-                    sys.stdout.flush()
+    # ── Determine chunk size ──────────────────────────────────────────────
+    chunk_tokens = _estimate_chunk_size(ctx_len)
+    n_chunks_approx = max(1, total_tokens // chunk_tokens)
+    print(f"  Chunk size: ~{human_num(chunk_tokens)} tokens  "
+          f"(≈{n_chunks_approx} chunk(s) per epoch)")
 
-    if show_prog:
-        sys.stdout.write("\n")
-
-    total_tokens = sum(len(t) for t in token_lists)
-    print(f"  Total tokens: {human_num(total_tokens)}  "
-          f"({time.perf_counter()-t0:.1f}s)")
-
-    # ── Build vocabulary ─────────────────────────────────────────────────
-    print("Building vocabulary…")
-    vocab = Vocabulary(max_size=vocab_size)
-    vocab.build(token_lists)
-    print(f"  Vocab size: {vocab.size}")
-
-    # ── Build dataset (CPU) ──────────────────────────────────────────────
-    print("Building training dataset…")
-    X, Y = build_dataset(token_lists, vocab, ctx_len)
-    del token_lists
-    N = X.shape[0]
-    print(f"  Samples: {human_num(N)}")
-
-    # ── Upload dataset to GPU if needed ──────────────────────────────────
-    if _xp is not np:
-        print("  Uploading dataset to GPU…")
-        X = _to_xp(X)
-        Y = _to_xp(Y)
-
-    # ── Init model + optimiser ───────────────────────────────────────────
+    # ── Init model + optimiser ────────────────────────────────────────────
+    print("\n  Pass 2/2 — initialising model…")
     model = NeuralLM(vocab.size, embed_dim, ctx_len, hidden_dim)
-    model.to_device()    # no-op on CPU; uploads params to GPU
+    model.to_device()
     adam  = AdamState(lr=lr)
 
-    param_count = sum(p.size for p in model.params.values())
+    param_count = sum(
+        int(np.prod((_to_numpy(v)).shape)) for v in model.params.values()
+    )
     print(f"  Parameters: {human_num(param_count)}")
-    print()
 
     hparams = {
         "vocab_size": vocab_size, "ctx_len": ctx_len,
@@ -677,51 +814,92 @@ def train(settings: dict) -> None:
 
     global_start = time.perf_counter()
 
+    # ── Training loop ─────────────────────────────────────────────────────
     for epoch in range(1, epochs + 1):
-        perm   = _xp.random.permutation(N)
-        X_shuf = X[perm]
-        Y_shuf = Y[perm]
+        epoch_start  = time.perf_counter()
+        epoch_loss   = 0.0
+        epoch_batches = 0
+        epoch_samples = 0
 
-        epoch_loss  = 0.0
-        n_batches   = 0
-        epoch_start = time.perf_counter()
-        batches_total = (N + batch_size - 1) // batch_size
+        print(f"\n── Epoch {epoch}/{epochs} ──────────────────────────────────────")
 
-        for b_start in range(0, N, batch_size):
-            Xb = X_shuf[b_start: b_start + batch_size]
-            Yb = Y_shuf[b_start: b_start + batch_size]
+        chunk_idx   = 0
+        chunk_start = time.perf_counter()
 
-            logits, cache = model.forward(Xb)
-            loss, grads   = model.backward(logits, Yb, cache)
+        for chunk_toks in _iter_file_chunks(files, lowercase, chunk_tokens):
+            chunk_idx += 1
 
-            adam.step(model.params, grads)
+            # Build dataset for this chunk (on CPU)
+            X_cpu, Y_cpu = build_dataset_from_tokens(chunk_toks, vocab, ctx_len)
+            N = X_cpu.shape[0]
+            del chunk_toks   # free token list immediately
 
-            epoch_loss += loss
-            n_batches  += 1
+            # Shuffle indices on CPU (avoids curand dependency)
+            perm     = np.random.permutation(N)
+            X_cpu    = X_cpu[perm]
+            Y_cpu    = Y_cpu[perm]
 
-            if show_prog and (n_batches % 20 == 0 or n_batches == batches_total):
-                elapsed   = max(0.001, time.perf_counter() - epoch_start)
-                avg_loss  = epoch_loss / n_batches
-                pct       = n_batches / batches_total
-                bar       = format_bar(n_batches, batches_total)
-                samp_sec  = (n_batches * batch_size) / elapsed
-                sys.stdout.write(
-                    f"\r  Epoch {epoch}/{epochs} {bar} "
-                    f"{pct*100:5.1f}%  loss={avg_loss:.4f}  "
-                    f"{human_num(samp_sec)}/s"
-                )
-                sys.stdout.flush()
+            # Upload to device if GPU
+            if _xp is not np:
+                X_dev = _to_xp(X_cpu)
+                Y_dev = _to_xp(Y_cpu)
+                del X_cpu, Y_cpu
+            else:
+                X_dev = X_cpu
+                Y_dev = Y_cpu
 
-        if show_prog:
-            sys.stdout.write("\n")
+            batches_in_chunk = (N + batch_size - 1) // batch_size
+            chunk_loss   = 0.0
+            chunk_batches = 0
+
+            for b_start in range(0, N, batch_size):
+                Xb = X_dev[b_start: b_start + batch_size]
+                Yb = Y_dev[b_start: b_start + batch_size]
+
+                logits, cache = model.forward(Xb)
+                loss, grads   = model.backward(logits, Yb, cache)
+                adam.step(model.params, grads)
+
+                chunk_loss    += loss
+                chunk_batches += 1
+                epoch_loss    += loss
+                epoch_batches += 1
+                epoch_samples += Xb.shape[0]
+
+                if show_prog and (chunk_batches % 20 == 0
+                                  or chunk_batches == batches_in_chunk):
+                    elapsed   = max(0.001, time.perf_counter() - chunk_start)
+                    avg_loss  = chunk_loss / chunk_batches
+                    pct       = chunk_batches / batches_in_chunk
+                    bar       = format_bar(chunk_batches, batches_in_chunk, 24)
+                    samp_sec  = (chunk_batches * batch_size) / elapsed
+                    usage     = _sys_usage_str()
+                    sys.stdout.write(
+                        f"\r  Chunk {chunk_idx} {bar} {pct*100:5.1f}%  "
+                        f"loss={avg_loss:.4f}  {human_num(samp_sec)}/s"
+                        + (f"  |  {usage}" if usage else "")
+                        + " " * 4
+                    )
+                    sys.stdout.flush()
+
+            if show_prog:
+                sys.stdout.write("\n")
+
+            del X_dev, Y_dev
 
         epoch_elapsed = time.perf_counter() - epoch_start
-        print(f"  Epoch {epoch} done — "
-              f"avg loss={epoch_loss/n_batches:.4f}  "
-              f"time={epoch_elapsed:.1f}s")
+        avg_epoch_loss = epoch_loss / max(1, epoch_batches)
+        print(
+            f"  Epoch {epoch} done — "
+            f"{chunk_idx} chunk(s)  "
+            f"avg loss={avg_epoch_loss:.4f}  "
+            f"samples={human_num(epoch_samples)}  "
+            f"time={epoch_elapsed:.1f}s"
+        )
 
-        # Save checkpoint (to_npz pulls weights back to CPU automatically)
+        # Save checkpoint after each epoch
         save_model(model, vocab, hparams, settings["model_file"])
+        print(f"  Checkpoint saved → {settings['model_file']}")
 
     if dl_thread:
         dl_thread.stop()
@@ -753,7 +931,7 @@ def generate_text(model: NeuralLM, vocab: Vocabulary,
 
     for _ in range(max_tokens):
         ctx_arr = np.array(ctx, dtype=np.int32)
-        probs   = model.predict_probs(ctx_arr)   # always returns CPU numpy
+        probs   = model.predict_probs(ctx_arr)
 
         temp   = max(0.05, float(temperature))
         logits = np.log(probs + 1e-12) / temp
@@ -803,7 +981,7 @@ def chat(settings: dict) -> None:
         return
 
     model, vocab, hparams = result
-    model.to_device()   # upload weights to GPU if active
+    model.to_device()
 
     backend_label = f"GPU:{gpu_device}" if _xp is not np else "CPU"
     print(f"Model loaded [{backend_label}] — vocab={vocab.size}  "
@@ -828,7 +1006,21 @@ def chat(settings: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Auto-Data Downloader  (unchanged)
+# File helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def find_text_files(folder: str) -> List[str]:
+    paths: List[str] = []
+    for root, _, files in os.walk(folder):
+        for name in files:
+            if name.lower().endswith(".txt"):
+                paths.append(os.path.join(root, name))
+    paths.sort()
+    return paths
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-Data Downloader  (multi-threaded + progress bars)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_id_cache(path: str) -> Set[int]:
@@ -900,6 +1092,7 @@ def _probe_id(book_id: int) -> bool:
 
 
 def _download_one_book(book_id: int, folder: str) -> Optional[str]:
+    """Download a single book, returning destination path or None on failure."""
     dest = os.path.join(folder, f"pg{book_id}.txt")
     if os.path.exists(dest):
         return None
@@ -922,6 +1115,127 @@ def _download_one_book(book_id: int, folder: str) -> Optional[str]:
         return None
 
 
+def _download_one_book_progress(book_id: int, folder: str,
+                                 status_dict: dict,
+                                 lock: threading.Lock) -> Optional[str]:
+    """
+    Download a single book with live byte-count reporting into status_dict.
+    status_dict[book_id] = {'done': bytes, 'total': bytes, 'state': str}
+    """
+    dest = os.path.join(folder, f"pg{book_id}.txt")
+    if os.path.exists(dest):
+        with lock:
+            status_dict[book_id] = {'done': 0, 'total': 0, 'state': 'exists'}
+        return None
+
+    url = GUTENBERG_URL.format(id=book_id)
+    with lock:
+        status_dict[book_id] = {'done': 0, 'total': 0, 'state': 'connecting'}
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "neural-lm/1.0"})
+        with urllib.request.urlopen(req, timeout=AD_DOWNLOAD_TIMEOUT) as resp:
+            cl = resp.headers.get("Content-Length")
+            total = int(cl) if cl else 0
+            with lock:
+                status_dict[book_id]['total'] = total
+                status_dict[book_id]['state'] = 'downloading'
+
+            chunks = []
+            done   = 0
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                done += len(chunk)
+                with lock:
+                    status_dict[book_id]['done'] = done
+
+        data = b"".join(chunks)
+        if len(data) < AD_MIN_BYTES:
+            with lock:
+                status_dict[book_id]['state'] = 'too_small'
+            return None
+
+        with open(dest, "wb") as f:
+            f.write(data)
+        with lock:
+            status_dict[book_id] = {'done': len(data), 'total': len(data), 'state': 'done'}
+        return dest
+
+    except Exception as e:
+        if os.path.exists(dest):
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+        with lock:
+            status_dict[book_id] = {'done': 0, 'total': 0, 'state': 'failed'}
+        return None
+
+
+def _render_download_status(status_dict: dict, lock: threading.Lock,
+                              n_done: int, n_total: int,
+                              started_at: float) -> None:
+    """Print live multi-book download status to stdout."""
+    with lock:
+        snap = dict(status_dict)
+
+    lines = []
+    bar_w = 20
+    for bid, info in sorted(snap.items()):
+        state = info['state']
+        done  = info['done']
+        total = info['total']
+
+        if state == 'done':
+            bar  = "=" * bar_w
+            size = human_bytes(done)
+            line = f"  pg{bid:<6}  [{'='*bar_w}] ✓  {size}"
+        elif state == 'failed':
+            line = f"  pg{bid:<6}  [{'✗':^{bar_w}}] FAILED"
+        elif state == 'too_small':
+            line = f"  pg{bid:<6}  [{'~':^{bar_w}}] too small, skipped"
+        elif state == 'exists':
+            line = f"  pg{bid:<6}  [already on disk]"
+        elif state == 'connecting':
+            line = f"  pg{bid:<6}  [{'…':^{bar_w}}] connecting…"
+        else:  # downloading
+            if total > 0:
+                ratio  = done / total
+                filled = int(ratio * bar_w)
+                bar    = "=" * filled + "-" * (bar_w - filled)
+                pct    = f"{ratio*100:4.0f}%  {human_bytes(done)}/{human_bytes(total)}"
+            else:
+                filled = int((done / (AD_MIN_BYTES * 4)) * bar_w)
+                filled = min(filled, bar_w - 1)
+                bar    = "=" * filled + ">"  + "-" * (bar_w - filled - 1)
+                pct    = f"~{human_bytes(done)}"
+            line = f"  pg{bid:<6}  [{bar}] {pct}"
+        lines.append(line)
+
+    # Overall progress + ETA
+    elapsed = max(0.001, time.perf_counter() - started_at)
+    if n_done > 0 and n_total > 0:
+        eta_s = (elapsed / n_done) * (n_total - n_done)
+        eta   = f"ETA {eta_s:.0f}s" if eta_s < 3600 else f"ETA {eta_s/60:.1f}m"
+    else:
+        eta = "ETA …"
+    overall = format_bar(n_done, n_total, 30)
+    lines.append(f"  Overall {overall} {n_done}/{n_total} books  {eta}  "
+                 f"elapsed {elapsed:.0f}s")
+
+    # Move cursor up and redraw
+    output = "\n".join(lines)
+    n_lines = len(lines)
+    # On first call the cursor is already at the right row; subsequent calls
+    # move it back up.
+    sys.stdout.write(output)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
 def _discover_ids(n_needed: int, already_have: Set[int],
                   discovered: Set[int], rejected: Set[int],
                   probe_workers: int = AD_PROBE_WORKERS,
@@ -940,7 +1254,7 @@ def _discover_ids(n_needed: int, already_have: Set[int],
         idx  += batch_size
         if verbose:
             sys.stdout.write(
-                f"\r  Probing…  found {len(good)}/{n_needed} usable so far   "
+                f"\r  Probing…  found {len(good)}/{n_needed} usable IDs   "
             )
             sys.stdout.flush()
         with ThreadPoolExecutor(max_workers=probe_workers) as ex:
@@ -984,10 +1298,19 @@ def _ready_ids(folder: str, n_needed: int,
     return queued[:n_needed]
 
 
-def auto_download_blocking(settings: dict, label_prefix: str = "") -> None:
+def auto_download_blocking(settings: dict,
+                            label_prefix: str = "",
+                            multithreaded: Optional[bool] = None) -> None:
+    """
+    Download books up to the configured cap.
+    multithreaded=None → respect settings["single_thread"].
+    """
     folder    = settings["input_folder"]
     max_books = int(settings["ad_max_books"])
     max_bytes = int(settings["ad_max_bytes"])
+    workers   = max(1, int(settings.get("workers", 4)))
+    if multithreaded is None:
+        multithreaded = not bool(settings.get("single_thread", False))
 
     ensure_folder(folder)
     count, used = _folder_state(folder)
@@ -1004,22 +1327,118 @@ def auto_download_blocking(settings: dict, label_prefix: str = "") -> None:
         print(f"{label_prefix}No usable IDs found.")
         return
 
+    # Clip to what we actually need
+    ids = ids[:slots]
+
+    if multithreaded and len(ids) > 1:
+        _download_books_parallel(ids, folder, max_books, max_bytes, workers)
+    else:
+        _download_books_serial(ids, folder, max_books, max_bytes)
+
+    count, used = _folder_state(folder)
+    print(f"\n{label_prefix}Done: {count} books, {used//1048576} MB.")
+
+
+def _download_books_serial(ids: List[int], folder: str,
+                            max_books: int, max_bytes: int) -> None:
     rejected_local: Set[int] = set()
-    for book_id in ids:
+    n_total = len(ids)
+    for i, book_id in enumerate(ids):
         count, used = _folder_state(folder)
         if count >= max_books or used >= max_bytes:
             break
-        sys.stdout.write(f"\r  Downloading pg{book_id}.txt …" + " " * 10)
+        bar = format_bar(i, n_total, 28)
+        sys.stdout.write(f"\r  {bar}  Downloading pg{book_id}.txt …" + " " * 10)
         sys.stdout.flush()
         path = _download_one_book(book_id, folder)
         if path:
             size = os.path.getsize(path)
-            sys.stdout.write(f"\r  ✓ pg{book_id}.txt  ({size//1024} KB)\n")
+            sys.stdout.write(f"\r  ✓ pg{book_id}.txt  ({size//1024} KB)" + " " * 20 + "\n")
         else:
-            sys.stdout.write(f"\r  ✗ pg{book_id}.txt  (failed)\n")
+            sys.stdout.write(f"\r  ✗ pg{book_id}.txt  (failed)" + " " * 20 + "\n")
             rejected_local.add(book_id)
         sys.stdout.flush()
 
+    _flush_rejected(rejected_local)
+
+
+def _download_books_parallel(ids: List[int], folder: str,
+                              max_books: int, max_bytes: int,
+                              workers: int) -> None:
+    """
+    Download books concurrently with a live per-book progress display.
+    """
+    n_total       = len(ids)
+    status_dict: dict = {}
+    lock          = threading.Lock()
+    n_done        = 0
+    rejected_local: Set[int] = set()
+    started_at    = time.perf_counter()
+
+    # Number of display lines we've already written (for cursor-up redraw)
+    _prev_lines   = [0]
+
+    def _refresh() -> None:
+        # Move cursor up past previous output
+        if _prev_lines[0] > 0:
+            sys.stdout.write(f"\033[{_prev_lines[0]}A\033[J")
+        _render_download_status(status_dict, lock,
+                                 n_done, n_total, started_at)
+        with lock:
+            _prev_lines[0] = len(status_dict) + 1   # +1 for overall line
+
+    print(f"  Downloading {n_total} books with {min(workers, n_total)} threads…\n")
+
+    with ThreadPoolExecutor(max_workers=min(workers, n_total)) as ex:
+        future_map = {}
+        submitted = 0
+        for bid in ids:
+            count, used = _folder_state(folder)
+            if count + submitted >= max_books or used >= max_bytes:
+                break
+            fut = ex.submit(
+                _download_one_book_progress,
+                bid, folder, status_dict, lock
+            )
+            future_map[fut] = bid
+            submitted += 1
+
+        # Live display loop
+        display_thread_stop = threading.Event()
+
+        def _display_loop():
+            while not display_thread_stop.is_set():
+                _refresh()
+                time.sleep(0.25)
+
+        disp = threading.Thread(target=_display_loop, daemon=True)
+        disp.start()
+
+        for fut in as_completed(future_map):
+            bid  = future_map[fut]
+            try:
+                path = fut.result()
+            except Exception:
+                path = None
+            if path is None:
+                with lock:
+                    st = status_dict.get(bid, {}).get('state', '')
+                if st not in ('exists', 'done'):
+                    rejected_local.add(bid)
+            n_done += 1
+
+        display_thread_stop.set()
+        disp.join()
+
+    # Final render
+    if _prev_lines[0] > 0:
+        sys.stdout.write(f"\033[{_prev_lines[0]}A\033[J")
+    _render_download_status(status_dict, lock, n_done, n_total, started_at)
+
+    _flush_rejected(rejected_local)
+
+
+def _flush_rejected(rejected_local: Set[int]) -> None:
     if rejected_local:
         rej  = _load_id_cache(REJECTED_FILE)
         disc = _load_id_cache(DISCOVERED_FILE)
@@ -1027,9 +1446,6 @@ def auto_download_blocking(settings: dict, label_prefix: str = "") -> None:
         disc -= rejected_local
         _save_id_cache(REJECTED_FILE,   rej)
         _save_id_cache(DISCOVERED_FILE, disc)
-
-    count, used = _folder_state(folder)
-    print(f"{label_prefix}Done: {count} books, {used//1048576}MB.")
 
 
 class AutoDownloadThread(threading.Thread):
@@ -1050,16 +1466,14 @@ class AutoDownloadThread(threading.Thread):
         refill_below = int(self._s["ad_refill_below"])
 
         ensure_folder(folder)
-        queue: List[int] = _ready_ids(folder, n_needed=max_books * 2,
-                                       verbose=False)
+        queue: List[int] = _ready_ids(folder, n_needed=max_books * 2, verbose=False)
         rejected_local: Set[int] = set()
 
         while not self._stop_evt.is_set():
             count, used = _folder_state(folder)
             if (count < refill_below) or (used < max_bytes and count < max_books):
                 if not queue:
-                    queue = _ready_ids(folder, n_needed=max_books * 2,
-                                       verbose=False)
+                    queue = _ready_ids(folder, n_needed=max_books * 2, verbose=False)
                 while queue and not self._stop_evt.is_set():
                     count, used = _folder_state(folder)
                     if count >= max_books or used >= max_bytes:
@@ -1070,31 +1484,11 @@ class AutoDownloadThread(threading.Thread):
                         rejected_local.add(bid)
             self._stop_evt.wait(timeout=self.POLL_INTERVAL)
 
-        if rejected_local:
-            rej  = _load_id_cache(REJECTED_FILE)
-            disc = _load_id_cache(DISCOVERED_FILE)
-            rej  |= rejected_local
-            disc -= rejected_local
-            _save_id_cache(REJECTED_FILE,   rej)
-            _save_id_cache(DISCOVERED_FILE, disc)
+        _flush_rejected(rejected_local)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# File helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def find_text_files(folder: str) -> List[str]:
-    paths: List[str] = []
-    for root, _, files in os.walk(folder):
-        for name in files:
-            if name.lower().endswith(".txt"):
-                paths.append(os.path.join(root, name))
-    paths.sort()
-    return paths
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Settings menu  (GPU section added)
+# Settings menu
 # ─────────────────────────────────────────────────────────────────────────────
 
 def show_settings(s: dict) -> None:
@@ -1115,12 +1509,13 @@ def show_settings(s: dict) -> None:
         for k in keys:
             print(f"    {k}: {s[k]}")
 
-    # GPU section
     use_gpu    = bool(s.get("use_gpu", False))
     gpu_device = int(s.get("gpu_device", 0))
     print(f"  ── GPU")
     print(f"    use_gpu:    {'ON' if use_gpu else 'OFF'}")
     if _cupy_available:
+        if not _curand_available:
+            print("    WARNING: libcurand.so missing — shuffle uses numpy fallback.")
         if _cupy_devices:
             for did, name in _cupy_devices:
                 marker = " ◀ selected" if (use_gpu and did == gpu_device) else ""
@@ -1128,11 +1523,16 @@ def show_settings(s: dict) -> None:
         else:
             print("    (CuPy installed but no CUDA devices found)")
     else:
-        print("    (CuPy not installed — install cupy-cuda11x or cupy-cuda12x)")
+        if _cupy_import_error:
+            print(f"    (CuPy import failed: {_cupy_import_error[:80]})")
+        else:
+            print("    (CuPy not installed — install cupy-cuda11x or cupy-cuda12x)")
 
     ad_on = s.get("auto_download", False)
+    mt    = not bool(s.get("single_thread", False))
     print(f"  ── Auto-Data Downloader")
     print(f"    auto_download:   {'ON' if ad_on else 'OFF'}")
+    print(f"    multi-thread DL: {'ON' if mt else 'OFF'} (workers: {s['workers']})")
     print(f"    ad_max_books:    {s['ad_max_books']}")
     print(f"    ad_max_bytes:    {s['ad_max_bytes']//1048576} MB")
     print(f"    ad_refill_below: {s['ad_refill_below']}")
@@ -1145,7 +1545,7 @@ def _gpu_submenu(s: dict) -> None:
         use_gpu    = bool(s.get("use_gpu", False))
         gpu_device = int(s.get("gpu_device", 0))
 
-        print(f"\n── GPU Settings ───────────────────────────────────────")
+        print(f"\n── GPU Settings ────────────────────────────────────────")
         print(f"  Status: {'ON' if use_gpu else 'OFF'}  |  "
               f"Selected device: {gpu_device}")
         print()
@@ -1153,15 +1553,21 @@ def _gpu_submenu(s: dict) -> None:
         print()
         print("1) Toggle GPU ON/OFF")
         print("2) Select GPU device")
+        print("3) Run GPU diagnostics")
         print("0) Back")
 
         c = input("> ").strip()
 
-        if c == "1":
+        if c == "3":
+            _gpu_diagnostics()
+        elif c == "1":
             if not _cupy_available:
-                print("CuPy is not installed.  "
-                      "Install with:  pip install cupy-cuda11x  "
-                      "(or cupy-cuda12x for CUDA 12)")
+                if _cupy_import_error:
+                    print(f"CuPy failed to import: {_cupy_import_error[:120]}")
+                else:
+                    print("CuPy is not installed.  "
+                          "Install with:  pip install cupy-cuda11x  "
+                          "(or cupy-cuda12x for CUDA 12)")
             elif not _cupy_devices:
                 print("No CUDA devices detected.")
             else:
@@ -1199,10 +1605,13 @@ def _auto_dl_submenu(s: dict) -> None:
         disc = _load_id_cache(DISCOVERED_FILE)
         rej  = _load_id_cache(REJECTED_FILE)
         ad_on = s.get("auto_download", False)
-        print(f"\n── Auto-Data Downloader ─────────────────────────────────")
+        mt    = not bool(s.get("single_thread", False))
+        print(f"\n── Auto-Data Downloader ────────────────────────────────")
         print(f"  Status: {'ON' if ad_on else 'OFF'}  |  "
               f"{count}/{s['ad_max_books']} books  "
               f"{used//1048576}/{s['ad_max_bytes']//1048576} MB")
+        print(f"  Multi-thread DL: {'ON' if mt else 'OFF'}  |  "
+              f"Workers: {s['workers']}")
         print(f"  Discovered: {len(disc)}   Rejected: {len(rej)}   "
               f"Probe range: {GUTENBERG_ID_MIN}–{GUTENBERG_ID_MAX}   "
               f"Min size: {AD_MIN_BYTES//1024} KB")
@@ -1211,9 +1620,10 @@ def _auto_dl_submenu(s: dict) -> None:
         print("2) Max books")
         print("3) Max total MB")
         print("4) Refill-below threshold")
-        print("5) Download now (blocking)")
-        print("6) Probe for new IDs now")
-        print("7) Clear caches")
+        print("5) Download now (multi-thread if enabled)")
+        print("6) Download now (single-thread)")
+        print("7) Probe for new IDs now")
+        print("8) Clear caches")
         print("0) Back")
 
         c = input("> ").strip()
@@ -1247,8 +1657,11 @@ def _auto_dl_submenu(s: dict) -> None:
                 pass
         elif c == "5":
             save_settings(s)
-            auto_download_blocking(s)
+            auto_download_blocking(s, multithreaded=mt)
         elif c == "6":
+            save_settings(s)
+            auto_download_blocking(s, multithreaded=False)
+        elif c == "7":
             folder = s["input_folder"]
             have   = _already_downloaded(folder)
             disc2  = _load_id_cache(DISCOVERED_FILE)
@@ -1263,7 +1676,7 @@ def _auto_dl_submenu(s: dict) -> None:
                 _save_id_cache(DISCOVERED_FILE, disc2)
                 _save_id_cache(REJECTED_FILE,   rej2)
                 print("\nInterrupted — partial results saved.")
-        elif c == "7":
+        elif c == "8":
             if input("Clear both caches? (y/N): ").strip().lower() == "y":
                 _save_id_cache(DISCOVERED_FILE, set())
                 _save_id_cache(REJECTED_FILE,   set())
@@ -1447,9 +1860,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.mode == "train":
-        train(s);    return
+        train(s);         return
     if args.mode == "chat":
-        chat(s);     return
+        chat(s);          return
     if args.mode == "settings":
         settings_menu(s); return
     if args.mode == "download":
@@ -1464,8 +1877,16 @@ def main() -> None:
         if use_gpu and _cupy_available and _cupy_devices:
             dev_name = _cupy_devices[gpu_device][1] if gpu_device < len(_cupy_devices) else "?"
             gpu_ind  = f" [GPU:{gpu_device} {dev_name}]"
+            if not _curand_available:
+                gpu_ind += " (curand missing—shuffle via numpy)"
         elif use_gpu:
-            gpu_ind = " [GPU: unavailable — will use CPU]"
+            if not _cupy_available:
+                reason = f": {_cupy_import_error[:60]}" if _cupy_import_error else " (not installed)"
+                gpu_ind = f" [GPU: import failed{reason} — using CPU]"
+            elif not _cupy_devices:
+                gpu_ind = " [GPU: no devices found — using CPU]"
+            else:
+                gpu_ind = " [GPU: unavailable — using CPU]"
         else:
             gpu_ind = " [CPU]"
 
