@@ -40,7 +40,7 @@
      } while(0)
 #endif
 
-// ── Float type (change to double for higher precision) ───────────────────────
+// ── Float type ───────────────────────────────────────────────────────────────
 using Float = float;
 
 // ── Special token strings ─────────────────────────────────────────────────────
@@ -50,15 +50,22 @@ inline constexpr const char* UNK_TOKEN = "<UNK>";
 // ── Gutenberg constants ───────────────────────────────────────────────────────
 inline constexpr int    GB_ID_MIN         = 1;
 inline constexpr int    GB_ID_MAX         = 75000;
-inline constexpr size_t GB_MIN_BYTES      = 40 * 1024;
+inline constexpr size_t GB_MIN_BYTES      = 10 * 1024;   // 10 KB after stripping
 inline constexpr int    GB_PROBE_WORKERS  = 6;
-inline constexpr int    GB_PROBE_TIMEOUT  = 10;   // seconds
-inline constexpr int    GB_DL_TIMEOUT     = 60;   // seconds
+inline constexpr int    GB_PROBE_TIMEOUT  = 15;   // seconds
+inline constexpr int    GB_DL_TIMEOUT     = 90;   // seconds
 inline constexpr double CHUNK_RAM_FRACTION = 0.40;
 
-// ── A flat 2-D array (row-major, heap-allocated, RAII) ───────────────────────
-// Used everywhere instead of vector-of-vectors to enable contiguous memcpy
-// and pointer arithmetic compatible with CUDA device memcpy.
+// ── Data source identifiers ───────────────────────────────────────────────────
+// Bitmask so they can be combined.
+inline constexpr int DS_GUTENBERG  = 1 << 0;
+inline constexpr int DS_WIKIPEDIA  = 1 << 1;
+inline constexpr int DS_WIKISOURCE = 1 << 2;
+inline constexpr int DS_STD_EBOOKS = 1 << 3;
+inline constexpr int DS_ALL        = DS_GUTENBERG | DS_WIKIPEDIA
+                                   | DS_WIKISOURCE | DS_STD_EBOOKS;
+
+// ── A flat 2-D array ─────────────────────────────────────────────────────────
 template<typename T>
 struct Matrix2D {
     std::vector<T> data;
@@ -79,7 +86,7 @@ struct Matrix2D {
     }
 };
 
-// ── Hyper-parameters (subset needed by model) ────────────────────────────────
+// ── Hyper-parameters ─────────────────────────────────────────────────────────
 struct HParams {
     int vocab_size  = 20000;
     int embed_dim   = 64;

@@ -25,7 +25,6 @@ static std::string json_escape(const std::string& s) {
     return out;
 }
 
-// Extract a string value from a JSON-like file. Very simple — no nesting.
 static bool json_get_str(const std::string& json,
                           const std::string& key,
                           std::string& out) {
@@ -86,7 +85,6 @@ static bool json_get_uint64(const std::string& json,
 
 Settings load_settings(const std::string& path) {
     Settings s;
-    // Sensible worker default based on hardware
     s.workers = std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2);
 
     if (!fs::exists(path)) return s;
@@ -120,6 +118,7 @@ Settings load_settings(const std::string& path) {
     json_get_int  (json, "ad_max_books",         s.ad_max_books);
     json_get_uint64(json,"ad_max_bytes",         s.ad_max_bytes);
     json_get_int  (json, "ad_refill_below",      s.ad_refill_below);
+    json_get_int  (json, "ad_sources",           s.ad_sources);
 
     return s;
 }
@@ -151,7 +150,8 @@ void save_settings(const Settings& s) {
     f << "  \"auto_download\":       " << b(s.auto_download)  << ",\n";
     f << "  \"ad_max_books\":        " << s.ad_max_books  << ",\n";
     f << "  \"ad_max_bytes\":        " << s.ad_max_bytes  << ",\n";
-    f << "  \"ad_refill_below\":     " << s.ad_refill_below << "\n";
+    f << "  \"ad_refill_below\":     " << s.ad_refill_below << ",\n";
+    f << "  \"ad_sources\":          " << s.ad_sources   << "\n";
     f << "}\n";
 }
 

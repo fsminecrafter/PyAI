@@ -39,10 +39,12 @@ struct Settings {
     int  gpu_device = 0;
 
     // ── Auto-downloader ───────────────────────────────────────────────────
-    bool   auto_download   = false;
-    int    ad_max_books    = 10;
-    size_t ad_max_bytes    = 100 * 1024 * 1024; // 100 MB
-    int    ad_refill_below = 5;
+    bool   auto_download    = false;
+    int    ad_max_books     = 10;
+    size_t ad_max_bytes     = 100 * 1024 * 1024; // 100 MB
+    int    ad_refill_below  = 5;
+    // Data sources bitmask (DS_* constants from neurallm.h)
+    int    ad_sources       = 0xF;  // all sources by default
 };
 
 // Load from JSON file (fills defaults for missing keys)
