@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(NeuralLM LANGUAGES CXX)
+project(pyai LANGUAGES CXX)
 
 # ── C++ standard ──────────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 17)
@@ -55,33 +55,33 @@ if(WITH_CUDA)
   list(APPEND SOURCES cuda/cuda_ops.cu)
 endif()
 
-add_executable(neurallm ${SOURCES})
+add_executable(pyai ${SOURCES})
 
-target_include_directories(neurallm PRIVATE include)
+target_include_directories(pyai PRIVATE include)
 
 if(WITH_CUDA)
-  target_include_directories(neurallm PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-  target_link_libraries(neurallm PRIVATE CUDA::cublas CUDA::curand)
-  set_target_properties(neurallm PROPERTIES
+  target_include_directories(pyai PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(pyai PRIVATE CUDA::cublas CUDA::curand)
+  set_target_properties(pyai PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
   )
 endif()
 
 # ── zlib for gzip (model save/load) ──────────────────────────────────────────
 find_package(ZLIB REQUIRED)
-target_link_libraries(neurallm PRIVATE ZLIB::ZLIB)
+target_link_libraries(pyai PRIVATE ZLIB::ZLIB)
 
 # ── Threading ─────────────────────────────────────────────────────────────────
 find_package(Threads REQUIRED)
-target_link_libraries(neurallm PRIVATE Threads::Threads)
+target_link_libraries(pyai PRIVATE Threads::Threads)
 
 # Windows: link ws2_32 for network I/O (downloader)
 if(WIN32)
-  target_link_libraries(neurallm PRIVATE ws2_32 winhttp)
+  target_link_libraries(pyai PRIVATE ws2_32 winhttp)
 endif()
 
 # ── Install ───────────────────────────────────────────────────────────────────
-install(TARGETS neurallm DESTINATION bin)
+install(TARGETS pyai DESTINATION bin)
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "Compiler:   ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")

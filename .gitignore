@@ -1,2 +1,4 @@
 *.json
+*.npz
 input_files/*
+build/*

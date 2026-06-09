@@ -31,14 +31,6 @@ static bool is_word_start(const unsigned char* p, size_t remaining) {
     return true;
 }
 
-static bool is_word_continue(const unsigned char* p) {
-    if (*p < 0x80) {
-        return (std::isalnum(*p) || *p == '_');
-    }
-    // Continuation byte or new multi-byte lead — either way, part of a word
-    return true;
-}
-
 // ── Tokenise ─────────────────────────────────────────────────────────────────
 
 std::vector<std::string> tokenize(const std::string& text, bool lowercase) {

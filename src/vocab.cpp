@@ -35,7 +35,6 @@ void Vocabulary::build_from_counts(const std::unordered_map<std::string, int64_t
     id2tok_.push_back(PAD_TOKEN);
     id2tok_.push_back(UNK_TOKEN);
 
-    int limit = max_size_ - 2;
     for (auto& [cnt, tok] : ranked) {
         if (static_cast<int>(id2tok_.size()) >= max_size_) break;
         if (tok == PAD_TOKEN || tok == UNK_TOKEN) continue;

@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <thread>
+#include <atomic>
 
 // Download books up to the caps in settings.
 // multithreaded: true=parallel, false=serial.
