@@ -14,6 +14,9 @@
 #include <string>
 #include <vector>
 
+//Cuda
+#include "cuda_ops.h"
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 std::string generate_text(NeuralLM& model, const Vocabulary& vocab,

@@ -15,7 +15,12 @@
 #include <iostream>
 
 #ifdef WITH_CUDA
-#  include "cuda_ops.h"
+#include "cuda_ops.h"
+NeuralLM::~NeuralLM() {
+#ifdef WITH_CUDA
+    delete cuda_ws_;
+#endif
+}
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -120,6 +125,7 @@ int64_t NeuralLM::num_params() const {
 void NeuralLM::to_device() {
 #ifdef WITH_CUDA
     p_.upload();
+    if (!cuda_ws_) cuda_ws_ = new CudaWorkspace();
     on_device_ = true;
 #endif
 }
@@ -136,7 +142,8 @@ void NeuralLM::forward(const int32_t* ctx_ids, int B,
                         float* logits_out, FwdCache& cache) const {
 #ifdef WITH_CUDA
     if (on_device_) {
-        cuda_forward(p_, hp_, ctx_ids, B, logits_out, cache);
+        if (!cuda_ws_) cuda_ws_ = new CudaWorkspace();
+        cuda_forward(p_, hp_, ctx_ids, B, logits_out, cache, *cuda_ws_);
         return;
     }
 #endif
@@ -209,11 +216,6 @@ void NeuralLM::forward(const int32_t* ctx_ids, int B,
 
 float NeuralLM::backward(const float* logits, const int32_t* targets, int B,
                           const FwdCache& cache, Params& grads) const {
-#ifdef WITH_CUDA
-    if (on_device_) {
-        return cuda_backward(p_, hp_, logits, targets, B, cache, grads);
-    }
-#endif
     const int D = hp_.embed_dim;
     const int C = hp_.ctx_len;
     const int H = hp_.hidden_dim;

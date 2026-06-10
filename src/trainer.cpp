@@ -26,6 +26,11 @@
 // zlib for gzip
 #include <zlib.h>
 
+#ifdef WITH_CUDA
+#  include "cuda_ops.h"
+#endif
+ 
+
 namespace fs = std::filesystem;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -323,13 +328,26 @@ void run_train(Settings& s) {
                 int B = std::min(s.batch_size, N - b_start);
                 const int32_t* Xb = dc.X.data() + static_cast<size_t>(b_start) * C;
                 const int32_t* Yb = dc.Y.data() + b_start;
+ 
+                float loss;
+#ifdef WITH_CUDA
+                if (s.use_gpu) {
+                    ++adam.t;  // keep CPU adam_t in sync for checkpoint consistency
+                    loss = cuda_train_step(model.params(), model.hp(),
+                                           Xb, Yb, B,
+                                           *model.cuda_ws_,
+                                           adam.lr, adam.beta1, adam.beta2, adam.eps,
+                                           adam.t);
+                } else
+#endif
+                {
+                    if (static_cast<int>(logits.size()) < B * V)
+                        logits.resize(static_cast<size_t>(B) * V);
+                    model.forward(Xb, B, logits.data(), cache);
+                    loss = model.backward(logits.data(), Yb, B, cache, grads);
+                    adam.step(model.params(), grads);
+                }
 
-                if (static_cast<int>(logits.size()) < B * V)
-                    logits.resize(static_cast<size_t>(B) * V);
-
-                model.forward(Xb, B, logits.data(), cache);
-                float loss = model.backward(logits.data(), Yb, B, cache, grads);
-                adam.step(model.params(), grads);
 
                 chunk_loss    += loss;
                 chunk_batches += 1;

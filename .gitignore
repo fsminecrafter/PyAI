@@ -2,3 +2,6 @@
 *.npz
 input_files/*
 build/*
+build_local/*
+
+pyai

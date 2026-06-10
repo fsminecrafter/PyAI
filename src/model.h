@@ -102,6 +102,13 @@ public:
 
     int64_t num_params() const;
 
+    #ifdef WITH_CUDA
+        // Opaque pointer — avoids circular include with cuda_ops.h
+        mutable struct CudaWorkspace* cuda_ws_ = nullptr;
+    #endif
+    
+    ~NeuralLM();
+
 private:
     HParams hp_;
     Params  p_;
@@ -109,3 +116,4 @@ private:
 
     void init_weights();
 };
+

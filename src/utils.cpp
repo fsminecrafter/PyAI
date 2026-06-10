@@ -25,6 +25,9 @@ namespace fs = std::filesystem;
 #  include <sys/sysinfo.h>
 #endif
 
+//Cuda
+#include "cuda_ops.h"
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 int term_width() {
